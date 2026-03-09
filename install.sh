@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh — Install claude-yolo from source
-# Usage: curl -fsSL https://<url>/install.sh | bash
+# Usage: curl -fsSL https://<url>/install.sh | bash && source ~/.bashrc
 set -euo pipefail
 
 REPO="https://github.com/claude-yolo/claude-yolo.git"
@@ -161,17 +161,19 @@ info "Linked claude-yolo → $BIN_DIR/claude-yolo"
 # -------------------------------------------------------------------
 # Ensure ~/.local/bin is in PATH
 # -------------------------------------------------------------------
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-    warn "$BIN_DIR is not in your PATH"
+# Detect shell config file
+SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
+case "$SHELL_NAME" in
+    zsh)  RC_FILE="$HOME/.zshrc" ;;
+    bash) RC_FILE="$HOME/.bashrc" ;;
+    fish) RC_FILE="$HOME/.config/fish/config.fish" ;;
+    *)    RC_FILE="$HOME/.profile" ;;
+esac
 
-    # Detect shell config file
-    SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-    case "$SHELL_NAME" in
-        zsh)  RC_FILE="$HOME/.zshrc" ;;
-        bash) RC_FILE="$HOME/.bashrc" ;;
-        fish) RC_FILE="$HOME/.config/fish/config.fish" ;;
-        *)    RC_FILE="$HOME/.profile" ;;
-    esac
+PATH_NEEDED=0
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
+    PATH_NEEDED=1
+    warn "$BIN_DIR is not in your PATH"
 
     EXPORT_LINE='export PATH="$HOME/.local/bin:$PATH"'
     if [[ "$SHELL_NAME" == "fish" ]]; then
@@ -183,7 +185,6 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     else
         printf '\n# Added by claude-yolo installer\n%s\n' "$EXPORT_LINE" >> "$RC_FILE"
         info "Added $BIN_DIR to PATH in $RC_FILE"
-        warn "Restart your shell or run: source $RC_FILE"
     fi
 fi
 
@@ -191,6 +192,11 @@ fi
 # Done
 # -------------------------------------------------------------------
 printf "\n${BOLD}${GREEN}claude-yolo installed successfully!${RESET}\n"
-printf "\n  Usage:\n"
+
+if [[ "$PATH_NEEDED" -eq 1 ]]; then
+    printf "\n  Run this to start using claude-yolo now:\n\n"
+    printf "    source %s\n\n" "$RC_FILE"
+fi
+printf "  Usage:\n"
 printf "    cd /path/to/your/project\n"
 printf "    claude-yolo \"fix the tests\" \"update docs\"\n\n"
