@@ -21,7 +21,35 @@ error() { printf "${RED}ERROR:${RESET} %s\n" "$*" >&2; exit 1; }
 # -------------------------------------------------------------------
 # Pre-flight checks
 # -------------------------------------------------------------------
-command -v git  &>/dev/null || error "git is required but not installed"
+if ! command -v git &>/dev/null; then
+    info "git is not installed — attempting to install"
+    OS_PRE="$(uname -s)"
+    if [[ "$OS_PRE" == Darwin* ]]; then
+        if command -v brew &>/dev/null; then
+            brew install git
+        else
+            error "git is required. Install Homebrew (https://brew.sh) then run: brew install git"
+        fi
+    elif [[ "$OS_PRE" == Linux* ]]; then
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get update && sudo apt-get install -y git
+        elif command -v dnf &>/dev/null; then
+            sudo dnf install -y git
+        elif command -v yum &>/dev/null; then
+            sudo yum install -y git
+        elif command -v pacman &>/dev/null; then
+            sudo pacman -S --noconfirm git
+        elif command -v apk &>/dev/null; then
+            sudo apk add git
+        else
+            error "git is required but no supported package manager found. Install git manually."
+        fi
+    else
+        error "git is required. Install it manually for your platform."
+    fi
+    command -v git &>/dev/null || error "git installation failed — install it manually and re-run"
+    info "git installed successfully"
+fi
 
 # -------------------------------------------------------------------
 # Detect OS
