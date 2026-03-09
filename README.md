@@ -25,16 +25,18 @@ When organization-managed settings force `ask` mode for tools like `Bash`, `Bash
 
 ## Installation
 
-**One-liner** (macOS, Linux, WSL):
+**One-liner** (macOS, Linux, WSL, Termux):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/claude-yolo/claude-yolo/refs/heads/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/claude-yolo/claude-yolo/refs/heads/main/install.sh | bash && source ~/.bashrc
 ```
 
-This clones to `~/.claude-yolo` and symlinks the binary into `~/.local/bin`. It also installs `tmux` and `claude` (Claude Code CLI) if they are missing. Override the install location with `CLAUDE_YOLO_HOME`:
+> For **zsh** users: replace `~/.bashrc` with `~/.zshrc`
+
+This clones to `~/.claude-yolo` and symlinks the binary into `~/.local/bin`. It also installs `git`, `tmux`, and `claude` (Claude Code CLI) if they are missing. Override the install location with `CLAUDE_YOLO_HOME`:
 
 ```bash
-CLAUDE_YOLO_HOME=~/my/path curl -fsSL https://raw.githubusercontent.com/claude-yolo/claude-yolo/refs/heads/main/install.sh | bash
+CLAUDE_YOLO_HOME=~/my/path curl -fsSL https://raw.githubusercontent.com/claude-yolo/claude-yolo/refs/heads/main/install.sh | bash && source ~/.bashrc
 ```
 
 **Manual install:**
