@@ -105,21 +105,31 @@ fi
 # -------------------------------------------------------------------
 if ! command -v claude &>/dev/null; then
     info "Claude Code CLI is not installed — installing"
-    curl -fsSL https://claude.ai/install.sh | bash
-    # Source shell config to pick up newly installed binary
-    SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-    case "$SHELL_NAME" in
-        zsh)  [[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc" 2>/dev/null || true ;;
-        bash) [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc" 2>/dev/null || true ;;
-        *)    [[ -f "$HOME/.profile" ]] && source "$HOME/.profile" 2>/dev/null || true ;;
-    esac
-    # Also check common install locations directly
-    for p in "$HOME/.claude/local/bin/claude" "$HOME/.local/bin/claude" "/usr/local/bin/claude"; do
-        if [[ -x "$p" ]]; then
-            export PATH="$(dirname "$p"):$PATH"
-            break
+    if [[ "$IS_TERMUX" -eq 1 ]]; then
+        # Termux: the official installer downloads a native binary that fails
+        # under Android's linker. Install via npm instead.
+        if ! command -v npm &>/dev/null; then
+            info "npm is not installed — installing via pkg"
+            pkg install -y nodejs
         fi
-    done
+        npm install -g @anthropic-ai/claude-code
+    else
+        curl -fsSL https://claude.ai/install.sh | bash
+        # Source shell config to pick up newly installed binary
+        SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
+        case "$SHELL_NAME" in
+            zsh)  [[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc" 2>/dev/null || true ;;
+            bash) [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc" 2>/dev/null || true ;;
+            *)    [[ -f "$HOME/.profile" ]] && source "$HOME/.profile" 2>/dev/null || true ;;
+        esac
+        # Also check common install locations directly
+        for p in "$HOME/.claude/local/bin/claude" "$HOME/.local/bin/claude" "/usr/local/bin/claude"; do
+            if [[ -x "$p" ]]; then
+                export PATH="$(dirname "$p"):$PATH"
+                break
+            fi
+        done
+    fi
     command -v claude &>/dev/null || warn "Claude Code CLI installed but not found in PATH — you may need to restart your shell"
 fi
 
