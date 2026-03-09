@@ -18,35 +18,50 @@ info()  { printf "${GREEN}==>${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}WARNING:${RESET} %s\n" "$*"; }
 error() { printf "${RED}ERROR:${RESET} %s\n" "$*" >&2; exit 1; }
 
+# Detect Termux (Android) — no sudo, uses pkg
+IS_TERMUX=0
+if [[ -n "${TERMUX_VERSION:-}" ]] || [[ -d /data/data/com.termux ]]; then
+    IS_TERMUX=1
+fi
+
+# Install a package using the appropriate package manager
+# Usage: install_pkg <package_name>
+install_pkg() {
+    local pkg="$1"
+    local os="$(uname -s)"
+    if [[ "$os" == Darwin* ]]; then
+        if command -v brew &>/dev/null; then
+            brew install "$pkg"
+        else
+            error "$pkg is required. Install Homebrew (https://brew.sh) then run: brew install $pkg"
+        fi
+    elif [[ "$os" == Linux* ]]; then
+        if [[ "$IS_TERMUX" -eq 1 ]]; then
+            pkg install -y "$pkg"
+        elif command -v apt-get &>/dev/null; then
+            sudo apt-get update && sudo apt-get install -y "$pkg"
+        elif command -v dnf &>/dev/null; then
+            sudo dnf install -y "$pkg"
+        elif command -v yum &>/dev/null; then
+            sudo yum install -y "$pkg"
+        elif command -v pacman &>/dev/null; then
+            sudo pacman -S --noconfirm "$pkg"
+        elif command -v apk &>/dev/null; then
+            sudo apk add "$pkg"
+        else
+            error "$pkg is required but no supported package manager found. Install $pkg manually."
+        fi
+    else
+        error "$pkg is required. Install it manually for your platform."
+    fi
+}
+
 # -------------------------------------------------------------------
 # Pre-flight checks
 # -------------------------------------------------------------------
 if ! command -v git &>/dev/null; then
     info "git is not installed — attempting to install"
-    OS_PRE="$(uname -s)"
-    if [[ "$OS_PRE" == Darwin* ]]; then
-        if command -v brew &>/dev/null; then
-            brew install git
-        else
-            error "git is required. Install Homebrew (https://brew.sh) then run: brew install git"
-        fi
-    elif [[ "$OS_PRE" == Linux* ]]; then
-        if command -v apt-get &>/dev/null; then
-            sudo apt-get update && sudo apt-get install -y git
-        elif command -v dnf &>/dev/null; then
-            sudo dnf install -y git
-        elif command -v yum &>/dev/null; then
-            sudo yum install -y git
-        elif command -v pacman &>/dev/null; then
-            sudo pacman -S --noconfirm git
-        elif command -v apk &>/dev/null; then
-            sudo apk add git
-        else
-            error "git is required but no supported package manager found. Install git manually."
-        fi
-    else
-        error "git is required. Install it manually for your platform."
-    fi
+    install_pkg git
     command -v git &>/dev/null || error "git installation failed — install it manually and re-run"
     info "git installed successfully"
 fi
@@ -58,7 +73,9 @@ OS="$(uname -s)"
 IS_WSL=0
 case "$OS" in
     Linux*)
-        if grep -qi microsoft /proc/version 2>/dev/null; then
+        if [[ "$IS_TERMUX" -eq 1 ]]; then
+            info "Detected platform: Termux (Android)"
+        elif grep -qi microsoft /proc/version 2>/dev/null; then
             info "Detected platform: WSL (Windows Subsystem for Linux)"
             IS_WSL=1
         else
@@ -78,29 +95,7 @@ esac
 # -------------------------------------------------------------------
 if ! command -v tmux &>/dev/null; then
     info "tmux is not installed — attempting to install"
-    if [[ "$OS" == Darwin* ]]; then
-        if command -v brew &>/dev/null; then
-            brew install tmux
-        else
-            error "tmux is required. Install Homebrew (https://brew.sh) then run: brew install tmux"
-        fi
-    elif [[ "$OS" == Linux* ]]; then
-        if command -v apt-get &>/dev/null; then
-            sudo apt-get update && sudo apt-get install -y tmux
-        elif command -v dnf &>/dev/null; then
-            sudo dnf install -y tmux
-        elif command -v yum &>/dev/null; then
-            sudo yum install -y tmux
-        elif command -v pacman &>/dev/null; then
-            sudo pacman -S --noconfirm tmux
-        elif command -v apk &>/dev/null; then
-            sudo apk add tmux
-        else
-            error "tmux is required but no supported package manager found. Install tmux manually."
-        fi
-    else
-        error "tmux is required. Install it manually for your platform."
-    fi
+    install_pkg tmux
     command -v tmux &>/dev/null || error "tmux installation failed — install it manually and re-run"
     info "tmux installed successfully"
 fi
