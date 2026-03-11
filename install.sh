@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # install.sh — Install claude-yolo from source
 # Usage: curl -fsSL https://<url>/install.sh | bash && source ~/.bashrc
+#        ./install.sh --local   # install from the current local repo
 set -euo pipefail
+
+LOCAL_INSTALL=0
+for arg in "$@"; do
+    case "$arg" in
+        --local) LOCAL_INSTALL=1 ;;
+        *) ;;
+    esac
+done
 
 REPO="https://github.com/claude-yolo/claude-yolo.git"
 INSTALL_DIR="${CLAUDE_YOLO_HOME:-$HOME/.claude-yolo}"
@@ -136,7 +145,18 @@ fi
 # -------------------------------------------------------------------
 # Install / update
 # -------------------------------------------------------------------
-if [[ -d "$INSTALL_DIR/.git" ]]; then
+if [[ "$LOCAL_INSTALL" -eq 1 ]]; then
+    LOCAL_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    info "Installing from local repo: $LOCAL_SRC"
+    if [[ "$LOCAL_SRC" == "$INSTALL_DIR" ]]; then
+        info "Local repo is already the install directory — skipping copy"
+    else
+        mkdir -p "$INSTALL_DIR"
+        rsync -a --exclude='.git' "$LOCAL_SRC/" "$INSTALL_DIR/" 2>/dev/null \
+            || cp -a "$LOCAL_SRC"/. "$INSTALL_DIR"/
+        info "Copied local repo to $INSTALL_DIR"
+    fi
+elif [[ -d "$INSTALL_DIR/.git" ]]; then
     info "Updating existing installation in $INSTALL_DIR"
     git -C "$INSTALL_DIR" checkout . 2>/dev/null
     git -C "$INSTALL_DIR" pull --ff-only || error "Failed to update. Resolve manually in $INSTALL_DIR"

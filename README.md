@@ -39,6 +39,14 @@ This clones to `~/.claude-yolo` and symlinks the binary into `~/.local/bin`. It 
 CLAUDE_YOLO_HOME=~/my/path curl -fsSL https://raw.githubusercontent.com/claude-yolo/claude-yolo/refs/heads/main/install.sh | bash && source ~/.bashrc
 ```
 
+**Local install** (from a cloned repo, no network access needed):
+
+```bash
+git clone https://github.com/claude-yolo/claude-yolo.git ~/.claude-yolo
+cd ~/.claude-yolo
+./install.sh --local
+```
+
 **Manual install:**
 
 ```bash
@@ -93,6 +101,9 @@ Re-attach later with `claude-yolo -r` (or `claude-yolo --resume`).
 -f, --file FILE       Read a multiline prompt from a text file
 -r, --resume          Re-attach to an existing yolo session
 -h, --help            Show help
+
+install.sh options:
+--local               Install from the local repo without pulling from GitHub
 ```
 
 ## How it works
