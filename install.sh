@@ -131,6 +131,7 @@ fi
 # -------------------------------------------------------------------
 if ! command -v claude &>/dev/null; then
     info "Claude Code CLI is not installed — installing"
+    CLAUDE_INSTALLED=0
     if [[ "$IS_TERMUX" -eq 1 ]]; then
         # Termux: the official installer downloads a native binary that fails
         # under Android's linker. Install via npm instead.
@@ -138,23 +139,41 @@ if ! command -v claude &>/dev/null; then
             info "npm is not installed — installing via pkg"
             pkg install -y nodejs
         fi
-        npm install -g @anthropic-ai/claude-code
+        npm install -g @anthropic-ai/claude-code && CLAUDE_INSTALLED=1
     else
-        curl -fsSL https://claude.ai/install.sh | bash
-        # Source shell config to pick up newly installed binary
-        SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-        case "$SHELL_NAME" in
-            zsh)  [[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc" 2>/dev/null || true ;;
-            bash) [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc" 2>/dev/null || true ;;
-            *)    [[ -f "$HOME/.profile" ]] && source "$HOME/.profile" 2>/dev/null || true ;;
-        esac
-        # Also check common install locations directly
-        for p in "$HOME/.claude/local/bin/claude" "$HOME/.local/bin/claude" "/usr/local/bin/claude"; do
-            if [[ -x "$p" ]]; then
-                export PATH="$(dirname "$p"):$PATH"
-                break
+        # Try the official binary installer first
+        if curl -fsSL https://claude.ai/install.sh | bash; then
+            CLAUDE_INSTALLED=1
+            # Source shell config to pick up newly installed binary
+            SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
+            case "$SHELL_NAME" in
+                zsh)  [[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc" 2>/dev/null || true ;;
+                bash) [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc" 2>/dev/null || true ;;
+                *)    [[ -f "$HOME/.profile" ]] && source "$HOME/.profile" 2>/dev/null || true ;;
+            esac
+            # Also check common install locations directly
+            for p in "$HOME/.claude/local/bin/claude" "$HOME/.local/bin/claude" "/usr/local/bin/claude"; do
+                if [[ -x "$p" ]]; then
+                    export PATH="$(dirname "$p"):$PATH"
+                    break
+                fi
+            done
+        fi
+        # Fall back to npm if the binary installer failed (e.g., unsupported arch)
+        if ! command -v claude &>/dev/null && [[ "$CLAUDE_INSTALLED" -eq 0 ]]; then
+            warn "Binary installer failed — falling back to npm install"
+            if ! command -v npm &>/dev/null; then
+                info "npm is not installed — attempting to install Node.js"
+                install_pkg nodejs
+                # Some distros package npm separately
+                command -v npm &>/dev/null || install_pkg npm
             fi
-        done
+            if command -v npm &>/dev/null; then
+                npm install -g @anthropic-ai/claude-code && CLAUDE_INSTALLED=1
+            else
+                warn "npm is not available — cannot install Claude Code CLI"
+            fi
+        fi
     fi
     command -v claude &>/dev/null || warn "Claude Code CLI installed but not found in PATH — you may need to restart your shell"
 fi
