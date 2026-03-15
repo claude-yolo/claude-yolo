@@ -173,7 +173,8 @@ if ! command -v claude &>/dev/null; then
             if command -v npm &>/dev/null; then
                 npm install -g @anthropic-ai/claude-code 2>/dev/null && CLAUDE_INSTALLED=1
             fi
-            # If distro Node.js failed (common on aarch64), try NodeSource v22
+            # If distro Node.js failed (common on aarch64 with 64KB pages),
+            # try NodeSource v22 with proper Node.js instead of Bun
             if [[ "$CLAUDE_INSTALLED" -eq 0 ]] && command -v apt-get &>/dev/null; then
                 warn "npm install failed — trying with Node.js 22 via NodeSource"
                 # Remove conflicting distro Node.js packages before installing NodeSource
@@ -181,7 +182,8 @@ if ! command -v claude &>/dev/null; then
                 $SUDO apt-get autoremove -y 2>/dev/null || true
                 if curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh 2>/dev/null; then
                     $SUDO bash /tmp/nodesource_setup.sh 2>/dev/null
-                    $SUDO apt-get install -y nodejs 2>/dev/null
+                    # Use --force-overwrite in case distro libnode-dev wasn't fully removed
+                    $SUDO apt-get install -y -o Dpkg::Options::="--force-overwrite" nodejs 2>/dev/null
                     rm -f /tmp/nodesource_setup.sh
                 fi
                 if command -v npm &>/dev/null; then
