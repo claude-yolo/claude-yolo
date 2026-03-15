@@ -68,6 +68,13 @@ install_pkg() {
 # -------------------------------------------------------------------
 # Pre-flight checks
 # -------------------------------------------------------------------
+if ! command -v curl &>/dev/null; then
+    info "curl is not installed — attempting to install"
+    install_pkg curl
+    command -v curl &>/dev/null || error "curl installation failed — install it manually and re-run"
+    info "curl installed successfully"
+fi
+
 if ! command -v git &>/dev/null; then
     info "git is not installed — attempting to install"
     install_pkg git
