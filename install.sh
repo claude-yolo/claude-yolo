@@ -162,16 +162,30 @@ if ! command -v claude &>/dev/null; then
         # Fall back to npm if the binary installer failed (e.g., unsupported arch)
         if ! command -v claude &>/dev/null && [[ "$CLAUDE_INSTALLED" -eq 0 ]]; then
             warn "Binary installer failed — falling back to npm install"
-            if ! command -v npm &>/dev/null; then
+            _ensure_npm() {
+                if command -v npm &>/dev/null; then return 0; fi
                 info "npm is not installed — attempting to install Node.js"
                 install_pkg nodejs
                 # Some distros package npm separately
                 command -v npm &>/dev/null || install_pkg npm
-            fi
+            }
+            _ensure_npm
             if command -v npm &>/dev/null; then
-                npm install -g @anthropic-ai/claude-code && CLAUDE_INSTALLED=1
-            else
-                warn "npm is not available — cannot install Claude Code CLI"
+                npm install -g @anthropic-ai/claude-code 2>/dev/null && CLAUDE_INSTALLED=1
+            fi
+            # If distro Node.js failed (common on aarch64), try NodeSource v22
+            if [[ "$CLAUDE_INSTALLED" -eq 0 ]]; then
+                warn "npm install failed — trying with Node.js 22 via NodeSource"
+                if curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh 2>/dev/null; then
+                    $SUDO bash /tmp/nodesource_setup.sh 2>/dev/null
+                    $SUDO apt-get install -y nodejs 2>/dev/null
+                    rm -f /tmp/nodesource_setup.sh
+                fi
+                if command -v npm &>/dev/null; then
+                    npm install -g @anthropic-ai/claude-code && CLAUDE_INSTALLED=1
+                else
+                    warn "npm is not available — cannot install Claude Code CLI"
+                fi
             fi
         fi
     fi
