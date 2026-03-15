@@ -175,7 +175,10 @@ if ! command -v claude &>/dev/null; then
             fi
         fi
     fi
-    command -v claude &>/dev/null || warn "Claude Code CLI installed but not found in PATH — you may need to restart your shell"
+    if ! command -v claude &>/dev/null; then
+        ARCH="$(uname -m)"
+        error "Claude Code CLI could not be installed (platform: $OS, arch: $ARCH). Install it manually: https://docs.anthropic.com/en/docs/claude-code/getting-started"
+    fi
 fi
 
 # -------------------------------------------------------------------
