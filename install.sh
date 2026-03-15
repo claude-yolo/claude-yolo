@@ -33,6 +33,12 @@ if [[ -n "${TERMUX_VERSION:-}" ]] || [[ -d /data/data/com.termux ]]; then
     IS_TERMUX=1
 fi
 
+# Use sudo only if not already root
+SUDO=""
+if [[ "$(id -u)" -ne 0 ]] && command -v sudo &>/dev/null; then
+    SUDO="sudo"
+fi
+
 # Install a package using the appropriate package manager
 # Usage: install_pkg <package_name>
 install_pkg() {
@@ -48,15 +54,15 @@ install_pkg() {
         if [[ "$IS_TERMUX" -eq 1 ]]; then
             pkg install -y "$pkg"
         elif command -v apt-get &>/dev/null; then
-            sudo apt-get update && sudo apt-get install -y "$pkg"
+            $SUDO apt-get update && $SUDO apt-get install -y "$pkg"
         elif command -v dnf &>/dev/null; then
-            sudo dnf install -y "$pkg"
+            $SUDO dnf install -y "$pkg"
         elif command -v yum &>/dev/null; then
-            sudo yum install -y "$pkg"
+            $SUDO yum install -y "$pkg"
         elif command -v pacman &>/dev/null; then
-            sudo pacman -S --noconfirm "$pkg"
+            $SUDO pacman -S --noconfirm "$pkg"
         elif command -v apk &>/dev/null; then
-            sudo apk add "$pkg"
+            $SUDO apk add "$pkg"
         else
             error "$pkg is required but no supported package manager found. Install $pkg manually."
         fi
