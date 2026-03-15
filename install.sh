@@ -33,10 +33,14 @@ if [[ -n "${TERMUX_VERSION:-}" ]] || [[ -d /data/data/com.termux ]]; then
     IS_TERMUX=1
 fi
 
-# Use sudo only if not already root
+# Use sudo only if not already root and sudo is available
 SUDO=""
-if [[ "$(id -u)" -ne 0 ]] && command -v sudo &>/dev/null; then
-    SUDO="sudo"
+if [[ "$IS_TERMUX" -eq 0 ]] && [[ "$(id -u)" -ne 0 ]]; then
+    if command -v sudo &>/dev/null; then
+        SUDO="sudo"
+    else
+        warn "Not running as root and sudo is not available — package installs may fail"
+    fi
 fi
 
 # Install a package using the appropriate package manager
