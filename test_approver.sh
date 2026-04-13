@@ -2376,6 +2376,10 @@ section "worktree-manager.sh — Git helpers"
 
 _SAVED_SCRIPT_DIR="$SCRIPT_DIR"
 
+# Ensure git user is configured (CI runners often lack this)
+git config user.name >/dev/null 2>&1 || git config --global user.name "test"
+git config user.email >/dev/null 2>&1 || git config --global user.email "test@test"
+
 source "$SCRIPT_DIR/lib/worktree-manager.sh"
 
 # Extract check_pair from conflict-daemon.sh without running main_loop.
