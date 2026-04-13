@@ -141,17 +141,21 @@ if ! command -v claude &>/dev/null; then
         fi
         npm install -g @anthropic-ai/claude-code && CLAUDE_INSTALLED=1
     else
+        # Ensure ~/.local/bin is in PATH before running Claude's installer —
+        # otherwise it prints a warning asking the user to do this manually.
+        if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
+            export PATH="$HOME/.local/bin:$PATH"
+            if [[ -f "$HOME/.bashrc" ]] && ! grep -qF '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+                printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.bashrc"
+                info "Added ~/.local/bin to PATH in ~/.bashrc"
+            fi
+        fi
         # Try the official binary installer first
         if curl -fsSL https://claude.ai/install.sh | bash; then
             CLAUDE_INSTALLED=1
-            # Source shell config to pick up newly installed binary
-            SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-            case "$SHELL_NAME" in
-                zsh)  [[ -f "$HOME/.zshrc" ]] && source "$HOME/.zshrc" 2>/dev/null || true ;;
-                bash) [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc" 2>/dev/null || true ;;
-                *)    [[ -f "$HOME/.profile" ]] && source "$HOME/.profile" 2>/dev/null || true ;;
-            esac
-            # Also check common install locations directly
+            # Check common install locations directly (sourcing shell rc files is
+            # unreliable inside set -euo pipefail — bashrc may reference unset vars
+            # or return non-zero from internal commands).
             for p in "$HOME/.claude/local/bin/claude" "$HOME/.local/bin/claude" "/usr/local/bin/claude"; do
                 if [[ -x "$p" ]]; then
                     export PATH="$(dirname "$p"):$PATH"

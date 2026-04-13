@@ -5,7 +5,7 @@
 
 # claude-yolo
 
-Run parallel Claude Code agents in tmux with automatic permission approval.
+Run parallel Claude Code agents in tmux with automatic permission approval. Optionally isolate each agent in its own git worktree with real-time merge conflict detection and automated conflict resolution.
 
 When organization-managed settings force `ask` mode for tools like `Bash`, `Bash(rm:*)`, and `WebFetch`, this tool auto-approves those prompts at the terminal level using `tmux capture-pane` + `send-keys`.
 
@@ -13,10 +13,12 @@ When organization-managed settings force `ask` mode for tools like `Bash`, `Bash
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Worktree mode](#worktree-mode)
 - [Navigation](#navigation)
 - [Options](#options)
 - [How it works](#how-it-works)
   - [Detection signals](#detection-signals)
+  - [Worktree pipeline](#worktree-pipeline)
 - [File structure](#file-structure)
 - [Prerequisites](#prerequisites)
 - [Testing](#testing)
@@ -76,6 +78,49 @@ claude-yolo -d /path/to/project "run the test suite and fix failures"
 
 Once launched, you're inside a tmux session with one window per agent. The last window (`control`) tails the audit log in real time.
 
+## Worktree mode
+
+With `--worktree` (`-w`), each agent gets its own git worktree and branch — full isolation, no stepping on each other's files:
+
+```bash
+claude-yolo -w -s feat -d /path/to/repo \
+  "implement auth system" \
+  "add database migrations" \
+  "write API tests"
+```
+
+This creates three worktrees (`feat-1`, `feat-2`, `feat-3`), each branched from the current HEAD. While agents work:
+
+- A **conflict daemon** polls `git merge-tree` every 5 seconds across all branch pairs and logs detected conflicts to the audit log
+- The **merge resolver** waits for all agents to finish, auto-commits any uncommitted changes, then sequentially merges each branch into the base
+- On merge conflict, a **resolver agent** (another Claude instance) is spawned to read the conflict markers, resolve them, and commit the merge
+
+```
+tmux windows in worktree mode:
+
+  agent-1   agent-2   agent-3   merge   control
+  ────────  ────────  ────────  ──────  ────────
+  Claude in Claude in Claude in Waits,  Tails
+  worktree  worktree  worktree  then    audit
+  feat-1/   feat-2/   feat-3/   merges  log
+```
+
+Skip auto-merge to inspect worktrees manually:
+
+```bash
+claude-yolo -w --no-merge -s feat -d /repo "task1" "task2"
+
+# After agents finish, inspect and merge yourself:
+git diff main..feat-1
+git diff main..feat-2
+git checkout main && git merge feat-1 && git merge feat-2
+
+# Clean up worktrees:
+source ~/.claude-yolo/lib/worktree-manager.sh && wt_cleanup feat
+```
+
+See [docs/worktree-mode-demo.md](docs/worktree-mode-demo.md) for a full walkthrough with a demo repo.
+
 ## Navigation
 
 | Key | Action |
@@ -100,6 +145,13 @@ Re-attach later with `claude-yolo -r` (or `claude-yolo --resume`).
 -r, --resume          Re-attach to an existing yolo session
 -h, --help            Show help
 
+Worktree options:
+-w, --worktree          Run each agent in its own git worktree
+--base-branch BRANCH    Base branch for worktrees (default: current branch)
+--no-merge              Skip auto-merge after agents complete
+--no-cleanup            Keep worktrees after merge
+--conflict-poll SECS    Conflict detection interval (default: 5)
+
 install.sh options:
 --local               Install from the local repo without pulling from GitHub
 ```
@@ -114,6 +166,14 @@ install.sh options:
    - If the transcript is collapsed (`● Bash(...)` visible but prompt hidden), sends `Ctrl+O` to expand it first — the next poll cycle then approves
    - Applies a 2-second per-pane cooldown to prevent double-approvals
 3. **Audit log** at `/tmp/claude-yolo-<session>.log` records every approval with timestamp, pane ID, and matched pattern. Each session gets its own log, so concurrent claude-yolo processes don't interfere.
+
+### Worktree pipeline
+
+When `--worktree` is enabled, three additional components run alongside the approver:
+
+1. **Worktree manager** (`lib/worktree-manager.sh`) creates a git worktree per agent in `<repo>-worktrees/<session>/`, each on its own branch forked from the base. A state file tracks branches and paths for later cleanup.
+2. **Conflict daemon** (`lib/conflict-daemon.sh`) polls every `--conflict-poll` seconds (default 5). For each unique pair of worktree branches it runs `git merge-tree --write-tree` (a read-only plumbing command, git 2.38+) to simulate a merge. Conflicts are logged to the audit log — visible in the `control` window.
+3. **Merge resolver** (`lib/merge-resolver.sh`) runs in a `merge` tmux window. It detects when each agent returns to the idle prompt (`❯`) and sends `/exit` to close Claude, then auto-commits any uncommitted changes. Branches are merged sequentially into the base. On conflict, a new Claude instance is spawned in a `resolve` window to read the conflict markers, resolve them, and commit the merge. The approver daemon handles the resolver's permission prompts.
 
 ### Detection signals
 
@@ -142,15 +202,21 @@ When a collapsed view is detected, the daemon sends `Ctrl+O` to expand it, then 
 ```
 claude-yolo              # Main launcher script
 lib/
-  common.sh              # Logging, prerequisite checks
+  common.sh              # Logging, prerequisite checks, git helpers
   approver-daemon.sh     # tmux capture-pane monitor + auto-approver
-test_approver.sh         # Test suite (131 tests)
+  worktree-manager.sh    # Git worktree lifecycle (create, list, cleanup)
+  conflict-daemon.sh     # Real-time conflict detection via git merge-tree
+  merge-resolver.sh      # Sequential merge + Claude-powered conflict resolution
+test_approver.sh         # Test suite (211 tests)
+docs/
+  worktree-mode-demo.md  # Step-by-step demo with Ubuntu 24.04 container
 ```
 
 ## Prerequisites
 
 - **tmux** (tested with 3.4)
 - **claude** (Claude Code CLI)
+- **git** 2.38+ (required for worktree mode — `git merge-tree --write-tree`)
 
 ## Testing
 
@@ -172,13 +238,20 @@ The test suite covers:
 - False positive resistance (code output, markdown, missing signals)
 - Cooldown logic, command construction, audit logging
 - End-to-end integration tests using real tmux sessions
+- Worktree creation, state file management, and cleanup
+- Conflict detection via `git merge-tree` (conflicting and clean merges)
+- Merge branch operations (fast-forward, divergent, conflict)
+- Launcher worktree flag parsing and validation
 
 ## Key features
 
-- **Parallel multi-agent execution** — Uniquely enables parallel execution of multiple Claude Code agents in tmux with non-invasive, terminal-level auto-approval of permissions.
+- **Parallel multi-agent execution** — Run multiple Claude Code agents in tmux with non-invasive, terminal-level auto-approval of permissions.
+- **Git worktree isolation** — Each agent works in its own worktree and branch. No file conflicts during execution, clean merge afterward.
+- **Real-time conflict detection** — A background daemon polls `git merge-tree` across all branch pairs and logs conflicts as they emerge.
+- **Automated conflict resolution** — On merge conflict, a Claude agent is spawned to read both sides, resolve conflict markers, and commit the merge.
 - **Sophisticated detection logic** — Handles both expanded and collapsed transcript views without modifying the Claude CLI or relying on the `--dangerously-skip-permissions` flag.
-- **Reliability and traceability** — Per-pane cooldowns, detailed audit logging, and an extensive test suite emphasize reliability and traceability.
-- **No CLI patching or containerization** — Unlike most alternatives, avoids direct CLI patching or containerization, making it suitable for environments where `ask` mode is enforced.
+- **Reliability and traceability** — Per-pane cooldowns, detailed audit logging, and 211 tests emphasize reliability and traceability.
+- **No CLI patching or containerization** — Avoids direct CLI patching or containerization, suitable for environments where `ask` mode is enforced.
 
 ## Development history
 

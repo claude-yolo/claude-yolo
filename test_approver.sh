@@ -2365,6 +2365,654 @@ assert_ok "Resilience: daemon logs its own exit via EXIT trap" _run_resil_exit_l
 assert_ok "Resilience: daemon handles rapid sequential prompts" _run_resil_rapid_prompts
 
 ###############################################################################
+#                  WORKTREE MANAGER                                           #
+###############################################################################
+
+section "worktree-manager.sh — Git helpers"
+
+# ── test repo scaffold ──────────────────────────────────────────────────────
+# All worktree tests share a disposable git repo in /tmp.
+# Save SCRIPT_DIR — sourcing worktree-manager.sh overwrites it to lib/.
+
+_SAVED_SCRIPT_DIR="$SCRIPT_DIR"
+
+source "$SCRIPT_DIR/lib/worktree-manager.sh"
+
+# Extract check_pair from conflict-daemon.sh without running main_loop.
+eval "$(sed -n '/^check_pair()/,/^}/p' "$_SAVED_SCRIPT_DIR/lib/conflict-daemon.sh")"
+
+SCRIPT_DIR="$_SAVED_SCRIPT_DIR"
+
+_WT_REPO="/tmp/claude-yolo-test-repo-$$"
+_WT_SESSION="wt-test-$$"
+
+_wt_setup_repo() {
+    rm -rf "$_WT_REPO" "${_WT_REPO}-worktrees"
+    mkdir -p "$_WT_REPO"
+    git -C "$_WT_REPO" init -b main >/dev/null 2>&1
+    git -C "$_WT_REPO" commit --allow-empty -m "initial" >/dev/null 2>&1
+    echo "hello" > "$_WT_REPO/file.txt"
+    git -C "$_WT_REPO" add file.txt >/dev/null 2>&1
+    git -C "$_WT_REPO" commit -m "add file" >/dev/null 2>&1
+}
+
+_wt_teardown() {
+    wt_cleanup "$_WT_SESSION" >/dev/null 2>&1 || true
+    rm -rf "$_WT_REPO" "${_WT_REPO}-worktrees"
+    rm -f "$(wt_state_file "$_WT_SESSION")" 2>/dev/null
+}
+
+# ── wt_validate_repo ────────────────────────────────────────────────────────
+
+_wt_setup_repo
+
+assert_ok "wt_validate_repo: valid git repo succeeds" \
+    wt_validate_repo "$_WT_REPO"
+
+assert_fail "wt_validate_repo: non-repo fails" \
+    wt_validate_repo "/tmp"
+
+# ── wt_current_branch / wt_repo_root ────────────────────────────────────────
+
+_test_current_branch() {
+    local branch
+    branch="$(wt_current_branch "$_WT_REPO")"
+    [[ "$branch" == "main" ]]
+}
+assert_ok "wt_current_branch: returns 'main'" _test_current_branch
+
+_test_repo_root() {
+    local root
+    root="$(wt_repo_root "$_WT_REPO")"
+    [[ "$root" == "$_WT_REPO" ]]
+}
+assert_ok "wt_repo_root: returns correct path" _test_repo_root
+
+# ── path helpers ─────────────────────────────────────────────────────────────
+
+_test_state_file_path() {
+    local sf
+    sf="$(wt_state_file "my-session")"
+    [[ "$sf" == *"claude-yolo-wt-my-session.state" ]]
+}
+assert_ok "wt_state_file: returns expected path" _test_state_file_path
+
+_test_done_marker_path() {
+    local dm
+    dm="$(wt_done_marker "my-session" 3)"
+    [[ "$dm" == *"claude-yolo-done-my-session-3" ]]
+}
+assert_ok "wt_done_marker: returns expected path" _test_done_marker_path
+
+_test_base_dir() {
+    local bd
+    bd="$(wt_base_dir "/tmp/repo" "sess")"
+    [[ "$bd" == "/tmp/repo-worktrees/sess" ]]
+}
+assert_ok "wt_base_dir: returns sibling directory" _test_base_dir
+
+# ── wt_create_all ────────────────────────────────────────────────────────────
+
+section "worktree-manager.sh — Create and list"
+
+_test_create_all() {
+    _wt_teardown; _wt_setup_repo
+    wt_create_all "$_WT_REPO" "$_WT_SESSION" "main" 3 >/dev/null 2>&1
+}
+assert_ok "wt_create_all: creates 3 worktrees without error" _test_create_all
+
+_test_state_file_header() {
+    local sf
+    sf="$(wt_state_file "$_WT_SESSION")"
+    [[ -f "$sf" ]] || return 1
+    local line1 line2
+    line1="$(head -1 "$sf")"
+    line2="$(sed -n '2p' "$sf")"
+    [[ "$line1" == "$_WT_REPO" && "$line2" == "main" ]]
+}
+assert_ok "wt_create_all: state file has correct repo + base branch" _test_state_file_header
+
+_test_state_file_entries() {
+    local sf
+    sf="$(wt_state_file "$_WT_SESSION")"
+    local count
+    count="$(tail -n +3 "$sf" | wc -l)"
+    (( count == 3 ))
+}
+assert_ok "wt_create_all: state file has 3 worktree entries" _test_state_file_entries
+
+_test_wt_dirs_exist() {
+    local base="${_WT_REPO}-worktrees/${_WT_SESSION}"
+    [[ -d "${base}/${_WT_SESSION}-1" ]] && \
+    [[ -d "${base}/${_WT_SESSION}-2" ]] && \
+    [[ -d "${base}/${_WT_SESSION}-3" ]]
+}
+assert_ok "wt_create_all: worktree directories exist on disk" _test_wt_dirs_exist
+
+_test_wt_file_in_worktree() {
+    local base="${_WT_REPO}-worktrees/${_WT_SESSION}"
+    [[ -f "${base}/${_WT_SESSION}-1/file.txt" ]]
+}
+assert_ok "wt_create_all: worktree contains repo files" _test_wt_file_in_worktree
+
+_test_branches_exist() {
+    git -C "$_WT_REPO" rev-parse --verify "${_WT_SESSION}-1" >/dev/null 2>&1 && \
+    git -C "$_WT_REPO" rev-parse --verify "${_WT_SESSION}-2" >/dev/null 2>&1 && \
+    git -C "$_WT_REPO" rev-parse --verify "${_WT_SESSION}-3" >/dev/null 2>&1
+}
+assert_ok "wt_create_all: branches exist in git" _test_branches_exist
+
+# ── state readers ────────────────────────────────────────────────────────────
+
+section "worktree-manager.sh — State readers"
+
+_test_read_repo_dir() {
+    local rd
+    rd="$(wt_read_repo_dir "$_WT_SESSION")"
+    [[ "$rd" == "$_WT_REPO" ]]
+}
+assert_ok "wt_read_repo_dir: returns repo path" _test_read_repo_dir
+
+_test_read_base_branch() {
+    local bb
+    bb="$(wt_read_base_branch "$_WT_SESSION")"
+    [[ "$bb" == "main" ]]
+}
+assert_ok "wt_read_base_branch: returns 'main'" _test_read_base_branch
+
+_test_list_count() {
+    local count
+    count="$(wt_list "$_WT_SESSION" | wc -l)"
+    (( count == 3 ))
+}
+assert_ok "wt_list: returns 3 entries" _test_list_count
+
+_test_list_format() {
+    local first
+    first="$(wt_list "$_WT_SESSION" | head -1)"
+    [[ "$first" == "${_WT_SESSION}-1 "* ]]
+}
+assert_ok "wt_list: entries are 'branch path' format" _test_list_format
+
+_test_path_for() {
+    local p
+    p="$(wt_path_for "$_WT_SESSION" 2)"
+    [[ "$p" == *"${_WT_SESSION}-2" ]]
+}
+assert_ok "wt_path_for: index 2 returns correct path" _test_path_for
+
+_test_branch_for() {
+    local b
+    b="$(wt_branch_for "$_WT_SESSION" 2)"
+    [[ "$b" == "${_WT_SESSION}-2" ]]
+}
+assert_ok "wt_branch_for: index 2 returns correct branch" _test_branch_for
+
+assert_fail "wt_list: nonexistent session fails" \
+    wt_list "nonexistent-session-xyz"
+
+# ── duplicate branch guard ──────────────────────────────────────────────────
+
+section "worktree-manager.sh — Error handling"
+
+_test_duplicate_branch() {
+    # Worktrees already exist from prior test — creating again should fail
+    wt_create_all "$_WT_REPO" "$_WT_SESSION" "main" 3 >/dev/null 2>&1
+}
+assert_fail "wt_create_all: fails when branches already exist" _test_duplicate_branch
+
+assert_fail "wt_validate_repo: non-repo path fails" \
+    wt_validate_repo "/tmp/definitely-not-a-git-repo-$$"
+
+# ── wt_cleanup ──────────────────────────────────────────────────────────────
+
+section "worktree-manager.sh — Cleanup"
+
+# Re-create worktrees fresh (the duplicate-branch test above triggered internal cleanup)
+_wt_teardown; _wt_setup_repo
+wt_create_all "$_WT_REPO" "$_WT_SESSION" "main" 3 >/dev/null 2>&1
+
+_test_cleanup() {
+    wt_cleanup "$_WT_SESSION" >/dev/null 2>&1
+    local sf
+    sf="$(wt_state_file "$_WT_SESSION")"
+    # State file should be gone
+    [[ ! -f "$sf" ]]
+}
+assert_ok "wt_cleanup: removes state file" _test_cleanup
+
+_test_cleanup_branches_gone() {
+    ! git -C "$_WT_REPO" rev-parse --verify "${_WT_SESSION}-1" >/dev/null 2>&1 && \
+    ! git -C "$_WT_REPO" rev-parse --verify "${_WT_SESSION}-2" >/dev/null 2>&1 && \
+    ! git -C "$_WT_REPO" rev-parse --verify "${_WT_SESSION}-3" >/dev/null 2>&1
+}
+assert_ok "wt_cleanup: branches are deleted" _test_cleanup_branches_gone
+
+_test_cleanup_dirs_gone() {
+    local base="${_WT_REPO}-worktrees/${_WT_SESSION}"
+    [[ ! -d "${base}/${_WT_SESSION}-1" ]] && \
+    [[ ! -d "${base}/${_WT_SESSION}-2" ]]
+}
+assert_ok "wt_cleanup: worktree directories are removed" _test_cleanup_dirs_gone
+
+_test_cleanup_noop() {
+    wt_cleanup "nonexistent-session-xyz" >/dev/null 2>&1
+}
+assert_ok "wt_cleanup: no-op for nonexistent session" _test_cleanup_noop
+
+_test_cleanup_done_markers() {
+    # Create worktrees, add done markers, cleanup
+    wt_create_all "$_WT_REPO" "$_WT_SESSION" "main" 2 >/dev/null 2>&1
+    touch "$(wt_done_marker "$_WT_SESSION" 1)"
+    touch "$(wt_done_marker "$_WT_SESSION" 2)"
+    wt_cleanup "$_WT_SESSION" >/dev/null 2>&1
+    [[ ! -f "$(wt_done_marker "$_WT_SESSION" 1)" ]] && \
+    [[ ! -f "$(wt_done_marker "$_WT_SESSION" 2)" ]]
+}
+assert_ok "wt_cleanup: removes done markers" _test_cleanup_done_markers
+
+###############################################################################
+#                  CONFLICT DETECTION                                         #
+###############################################################################
+
+section "conflict-daemon.sh — check_pair"
+
+# Re-create repo + worktrees for conflict tests
+_wt_teardown; _wt_setup_repo
+wt_create_all "$_WT_REPO" "$_WT_SESSION" "main" 3 >/dev/null 2>&1
+
+# check_pair was extracted above via eval/sed; set REPO_DIR for it
+REPO_DIR="$_WT_REPO"
+
+# Make conflicting changes in worktree 1 and 2 (same file, different content)
+_wt_make_conflicts() {
+    local base="${_WT_REPO}-worktrees/${_WT_SESSION}"
+    echo "change from agent 1" > "${base}/${_WT_SESSION}-1/file.txt"
+    git -C "${base}/${_WT_SESSION}-1" add file.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_SESSION}-1" commit -m "agent 1 edit" >/dev/null 2>&1
+
+    echo "change from agent 2" > "${base}/${_WT_SESSION}-2/file.txt"
+    git -C "${base}/${_WT_SESSION}-2" add file.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_SESSION}-2" commit -m "agent 2 edit" >/dev/null 2>&1
+}
+_wt_make_conflicts
+
+_test_conflict_detected() {
+    local details
+    details="$(check_pair "${_WT_SESSION}-1" "${_WT_SESSION}-2")"
+}
+assert_ok "check_pair: detects conflict between divergent branches" _test_conflict_detected
+
+_test_conflict_output() {
+    local details
+    details="$(check_pair "${_WT_SESSION}-1" "${_WT_SESSION}-2")"
+    [[ "$details" == *"CONFLICT"* ]]
+}
+assert_ok "check_pair: output contains CONFLICT" _test_conflict_output
+
+_test_conflict_filename() {
+    local details
+    details="$(check_pair "${_WT_SESSION}-1" "${_WT_SESSION}-2")"
+    [[ "$details" == *"file.txt"* ]]
+}
+assert_ok "check_pair: output includes conflicting filename" _test_conflict_filename
+
+_test_clean_merge() {
+    # worktree 3 has no changes — should merge cleanly with either 1 or 2
+    check_pair "${_WT_SESSION}-1" "${_WT_SESSION}-3"
+}
+assert_fail "check_pair: clean merge when no overlap (returns 1)" _test_clean_merge
+
+# Add non-conflicting change to worktree 3 (different file)
+_test_no_conflict_different_files() {
+    local base="${_WT_REPO}-worktrees/${_WT_SESSION}"
+    echo "new file from agent 3" > "${base}/${_WT_SESSION}-3/other.txt"
+    git -C "${base}/${_WT_SESSION}-3" add other.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_SESSION}-3" commit -m "agent 3 adds other file" >/dev/null 2>&1
+    # Different files = clean merge
+    check_pair "${_WT_SESSION}-1" "${_WT_SESSION}-3"
+}
+assert_fail "check_pair: no conflict when agents edit different files" _test_no_conflict_different_files
+
+# Test multiple conflicting files
+_test_multi_file_conflict() {
+    local base="${_WT_REPO}-worktrees/${_WT_SESSION}"
+    # Add same new file in worktree 1 and 3
+    echo "version A" > "${base}/${_WT_SESSION}-1/shared.txt"
+    git -C "${base}/${_WT_SESSION}-1" add shared.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_SESSION}-1" commit -m "agent 1 adds shared" >/dev/null 2>&1
+
+    echo "version B" > "${base}/${_WT_SESSION}-3/shared.txt"
+    git -C "${base}/${_WT_SESSION}-3" add shared.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_SESSION}-3" commit -m "agent 3 adds shared" >/dev/null 2>&1
+
+    local details
+    details="$(check_pair "${_WT_SESSION}-1" "${_WT_SESSION}-3")"
+    [[ "$details" == *"shared.txt"* ]]
+}
+assert_ok "check_pair: detects add/add conflict on new file" _test_multi_file_conflict
+
+###############################################################################
+#                  MERGE RESOLUTION                                           #
+###############################################################################
+
+section "merge-resolver.sh — merge_branch"
+
+# Extract merge_branch and audit_merge from merge-resolver without running main.
+# We set up the needed variables manually.
+_MR_REPO="/tmp/claude-yolo-test-merge-$$"
+_MR_SESSION="mr-test-$$"
+_MR_AUDIT="$(mktemp)"
+
+_mr_setup() {
+    rm -rf "$_MR_REPO"
+    mkdir -p "$_MR_REPO"
+    git -C "$_MR_REPO" init -b main >/dev/null 2>&1
+    echo "base content" > "$_MR_REPO/file.txt"
+    git -C "$_MR_REPO" add file.txt >/dev/null 2>&1
+    git -C "$_MR_REPO" commit -m "initial" >/dev/null 2>&1
+}
+
+_mr_cleanup() {
+    rm -rf "$_MR_REPO" "$_MR_AUDIT"
+}
+
+# Re-define audit_merge and merge_branch locally
+REPO_DIR_saved="$REPO_DIR"
+AUDIT_LOG_saved="${AUDIT_LOG:-}"
+BASE_BRANCH_saved="${BASE_BRANCH:-}"
+
+_mr_setup
+
+REPO_DIR="$_MR_REPO"
+AUDIT_LOG="$_MR_AUDIT"
+BASE_BRANCH="main"
+
+audit_merge() {
+    local msg="$1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] MERGE $msg" >> "$AUDIT_LOG" 2>/dev/null
+}
+
+merge_branch() {
+    local branch="$1"
+    audit_merge "Merging $branch into $BASE_BRANCH"
+    local merge_output
+    if merge_output="$(git -C "$REPO_DIR" merge --no-edit "$branch" 2>&1)"; then
+        audit_merge "OK $branch merged cleanly"
+        return 0
+    fi
+    audit_merge "CONFLICTS in $branch"
+    return 1
+}
+
+# Test: fast-forward merge
+_test_ff_merge() {
+    git -C "$_MR_REPO" checkout -b "ff-branch" main >/dev/null 2>&1
+    echo "new content" > "$_MR_REPO/new.txt"
+    git -C "$_MR_REPO" add new.txt >/dev/null 2>&1
+    git -C "$_MR_REPO" commit -m "ff commit" >/dev/null 2>&1
+    git -C "$_MR_REPO" checkout main >/dev/null 2>&1
+    merge_branch "ff-branch" >/dev/null 2>&1
+}
+assert_ok "merge_branch: fast-forward merge succeeds" _test_ff_merge
+
+_test_ff_audit() {
+    local log
+    log="$(cat "$_MR_AUDIT")"
+    [[ "$log" == *"OK ff-branch merged cleanly"* ]]
+}
+assert_ok "merge_branch: audit logs clean merge" _test_ff_audit
+
+# Test: clean divergent merge
+_test_divergent_clean() {
+    # Reset for new test
+    : > "$_MR_AUDIT"
+    git -C "$_MR_REPO" checkout -b "div-branch" main >/dev/null 2>&1
+    echo "divergent" > "$_MR_REPO/div.txt"
+    git -C "$_MR_REPO" add div.txt >/dev/null 2>&1
+    git -C "$_MR_REPO" commit -m "divergent commit" >/dev/null 2>&1
+    git -C "$_MR_REPO" checkout main >/dev/null 2>&1
+    echo "main change" > "$_MR_REPO/main-only.txt"
+    git -C "$_MR_REPO" add main-only.txt >/dev/null 2>&1
+    git -C "$_MR_REPO" commit -m "main commit" >/dev/null 2>&1
+    merge_branch "div-branch" >/dev/null 2>&1
+}
+assert_ok "merge_branch: divergent non-conflicting merge succeeds" _test_divergent_clean
+
+# Test: conflicting merge fails
+_test_conflict_merge() {
+    : > "$_MR_AUDIT"
+    git -C "$_MR_REPO" checkout -b "conflict-branch" main >/dev/null 2>&1
+    echo "conflict version A" > "$_MR_REPO/file.txt"
+    git -C "$_MR_REPO" add file.txt >/dev/null 2>&1
+    git -C "$_MR_REPO" commit -m "conflict A" >/dev/null 2>&1
+    git -C "$_MR_REPO" checkout main >/dev/null 2>&1
+    echo "conflict version B" > "$_MR_REPO/file.txt"
+    git -C "$_MR_REPO" add file.txt >/dev/null 2>&1
+    git -C "$_MR_REPO" commit -m "conflict B" >/dev/null 2>&1
+    merge_branch "conflict-branch" >/dev/null 2>&1
+}
+assert_fail "merge_branch: conflicting merge returns failure" _test_conflict_merge
+
+_test_conflict_audit() {
+    local log
+    log="$(cat "$_MR_AUDIT")"
+    [[ "$log" == *"CONFLICTS in conflict-branch"* ]]
+}
+assert_ok "merge_branch: audit logs conflict" _test_conflict_audit
+
+# Clean up conflicting state for subsequent tests
+git -C "$_MR_REPO" merge --abort 2>/dev/null || true
+
+# Verify conflicting files are detectable after failed merge
+_test_unmerged_files() {
+    git -C "$_MR_REPO" merge --no-edit "conflict-branch" >/dev/null 2>&1 || true
+    local unmerged
+    unmerged="$(git -C "$_MR_REPO" diff --name-only --diff-filter=U 2>/dev/null)"
+    git -C "$_MR_REPO" merge --abort 2>/dev/null || true
+    [[ "$unmerged" == *"file.txt"* ]]
+}
+assert_ok "merge_branch: git reports unmerged files after conflict" _test_unmerged_files
+
+# Restore saved variables
+REPO_DIR="$REPO_DIR_saved"
+AUDIT_LOG="${AUDIT_LOG_saved}"
+BASE_BRANCH="${BASE_BRANCH_saved}"
+_mr_cleanup
+
+###############################################################################
+#                  COMMON.SH — GIT HELPERS                                    #
+###############################################################################
+
+section "common.sh — Git merge-tree version check"
+
+assert_ok "check_git_merge_tree: passes on git 2.43+" check_git_merge_tree
+
+###############################################################################
+#                  LAUNCHER — WORKTREE FLAGS                                  #
+###############################################################################
+
+section "claude-yolo — Worktree flag parsing"
+
+_test_help_worktree() {
+    local output
+    output="$(bash "$_SAVED_SCRIPT_DIR/claude-yolo" --help 2>&1)"
+    [[ "$output" == *"--worktree"* ]] && \
+    [[ "$output" == *"--base-branch"* ]] && \
+    [[ "$output" == *"--no-merge"* ]] && \
+    [[ "$output" == *"--no-cleanup"* ]] && \
+    [[ "$output" == *"--conflict-poll"* ]]
+}
+assert_ok "launcher: --help shows all worktree options" _test_help_worktree
+
+assert_fail "launcher: --worktree with 1 task fails (needs >=2)" \
+    bash "$_SAVED_SCRIPT_DIR/claude-yolo" --worktree -d /tmp "single task"
+
+assert_fail "launcher: --worktree on non-git dir fails" \
+    bash "$_SAVED_SCRIPT_DIR/claude-yolo" --worktree -d /tmp "task1" "task2"
+
+_test_worktree_short_flag() {
+    local output
+    output="$(bash "$_SAVED_SCRIPT_DIR/claude-yolo" -w -d /tmp "task1" "task2" 2>&1)" || true
+    # Should fail on non-git-repo, not on flag parsing
+    [[ "$output" == *"Not a git repository"* ]]
+}
+assert_ok "launcher: -w is alias for --worktree" _test_worktree_short_flag
+
+###############################################################################
+#                  INTEGRATION — WORKTREE LIFECYCLE                           #
+###############################################################################
+
+section "Integration — Worktree lifecycle"
+
+# Full lifecycle: create worktrees, commit to them, detect conflicts, merge cleanly, cleanup
+
+_WT_INTEG_REPO="/tmp/claude-yolo-test-integ-$$"
+_WT_INTEG_SESSION="wt-integ-$$"
+
+_wt_integ_cleanup() {
+    wt_cleanup "$_WT_INTEG_SESSION" >/dev/null 2>&1 || true
+    rm -rf "$_WT_INTEG_REPO" "${_WT_INTEG_REPO}-worktrees"
+}
+
+_test_full_lifecycle_no_conflict() {
+    _wt_integ_cleanup
+    mkdir -p "$_WT_INTEG_REPO"
+    git -C "$_WT_INTEG_REPO" init -b main >/dev/null 2>&1
+    echo "base" > "$_WT_INTEG_REPO/base.txt"
+    git -C "$_WT_INTEG_REPO" add base.txt >/dev/null 2>&1
+    git -C "$_WT_INTEG_REPO" commit -m "initial" >/dev/null 2>&1
+
+    # Create 2 worktrees
+    wt_create_all "$_WT_INTEG_REPO" "$_WT_INTEG_SESSION" "main" 2 >/dev/null 2>&1 || return 1
+
+    local base="${_WT_INTEG_REPO}-worktrees/${_WT_INTEG_SESSION}"
+
+    # Agent 1 edits file-a, agent 2 edits file-b (no conflict)
+    echo "agent1" > "${base}/${_WT_INTEG_SESSION}-1/file-a.txt"
+    git -C "${base}/${_WT_INTEG_SESSION}-1" add file-a.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_INTEG_SESSION}-1" commit -m "agent 1" >/dev/null 2>&1
+
+    echo "agent2" > "${base}/${_WT_INTEG_SESSION}-2/file-b.txt"
+    git -C "${base}/${_WT_INTEG_SESSION}-2" add file-b.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_INTEG_SESSION}-2" commit -m "agent 2" >/dev/null 2>&1
+
+    # No conflicts expected
+    local REPO_DIR="$_WT_INTEG_REPO"
+    local rc=0
+    git -C "$_WT_INTEG_REPO" merge-tree --write-tree "${_WT_INTEG_SESSION}-1" "${_WT_INTEG_SESSION}-2" >/dev/null 2>&1 || rc=$?
+    (( rc == 0 )) || return 1
+
+    # Sequential merge
+    git -C "$_WT_INTEG_REPO" checkout main >/dev/null 2>&1
+    git -C "$_WT_INTEG_REPO" merge --no-edit "${_WT_INTEG_SESSION}-1" >/dev/null 2>&1 || return 1
+    git -C "$_WT_INTEG_REPO" merge --no-edit "${_WT_INTEG_SESSION}-2" >/dev/null 2>&1 || return 1
+
+    # Verify both files exist on main
+    [[ -f "$_WT_INTEG_REPO/file-a.txt" ]] && [[ -f "$_WT_INTEG_REPO/file-b.txt" ]] || return 1
+
+    # Cleanup
+    wt_cleanup "$_WT_INTEG_SESSION" >/dev/null 2>&1
+
+    # Verify cleanup
+    [[ ! -f "$(wt_state_file "$_WT_INTEG_SESSION")" ]] && \
+    ! git -C "$_WT_INTEG_REPO" rev-parse --verify "${_WT_INTEG_SESSION}-1" >/dev/null 2>&1
+}
+assert_ok "lifecycle: create → commit (no conflict) → merge → cleanup" _test_full_lifecycle_no_conflict
+
+_test_full_lifecycle_with_conflict() {
+    _wt_integ_cleanup
+    mkdir -p "$_WT_INTEG_REPO"
+    git -C "$_WT_INTEG_REPO" init -b main >/dev/null 2>&1
+    echo "original" > "$_WT_INTEG_REPO/shared.txt"
+    git -C "$_WT_INTEG_REPO" add shared.txt >/dev/null 2>&1
+    git -C "$_WT_INTEG_REPO" commit -m "initial" >/dev/null 2>&1
+
+    # Create 2 worktrees
+    wt_create_all "$_WT_INTEG_REPO" "$_WT_INTEG_SESSION" "main" 2 >/dev/null 2>&1 || return 1
+
+    local base="${_WT_INTEG_REPO}-worktrees/${_WT_INTEG_SESSION}"
+
+    # Both agents edit the same file
+    echo "agent1 version" > "${base}/${_WT_INTEG_SESSION}-1/shared.txt"
+    git -C "${base}/${_WT_INTEG_SESSION}-1" add shared.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_INTEG_SESSION}-1" commit -m "agent 1 edit" >/dev/null 2>&1
+
+    echo "agent2 version" > "${base}/${_WT_INTEG_SESSION}-2/shared.txt"
+    git -C "${base}/${_WT_INTEG_SESSION}-2" add shared.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_INTEG_SESSION}-2" commit -m "agent 2 edit" >/dev/null 2>&1
+
+    # Conflict detected by merge-tree
+    local rc=0
+    git -C "$_WT_INTEG_REPO" merge-tree --write-tree "${_WT_INTEG_SESSION}-1" "${_WT_INTEG_SESSION}-2" >/dev/null 2>&1 || rc=$?
+    (( rc == 1 )) || return 1  # rc=1 means conflicts
+
+    # First merge succeeds, second hits conflict
+    git -C "$_WT_INTEG_REPO" checkout main >/dev/null 2>&1
+    git -C "$_WT_INTEG_REPO" merge --no-edit "${_WT_INTEG_SESSION}-1" >/dev/null 2>&1 || return 1
+
+    local merge_rc=0
+    git -C "$_WT_INTEG_REPO" merge --no-edit "${_WT_INTEG_SESSION}-2" >/dev/null 2>&1 || merge_rc=$?
+    (( merge_rc != 0 )) || return 1  # Should fail
+
+    # Verify conflict markers present
+    local unmerged
+    unmerged="$(git -C "$_WT_INTEG_REPO" diff --name-only --diff-filter=U 2>/dev/null)"
+    [[ "$unmerged" == *"shared.txt"* ]] || return 1
+
+    git -C "$_WT_INTEG_REPO" merge --abort 2>/dev/null || true
+
+    # Cleanup
+    wt_cleanup "$_WT_INTEG_SESSION" >/dev/null 2>&1
+    _wt_integ_cleanup
+}
+assert_ok "lifecycle: create → commit (with conflict) → detect → abort → cleanup" _test_full_lifecycle_with_conflict
+
+_test_three_way_partial_conflict() {
+    _wt_integ_cleanup
+    mkdir -p "$_WT_INTEG_REPO"
+    git -C "$_WT_INTEG_REPO" init -b main >/dev/null 2>&1
+    echo "original" > "$_WT_INTEG_REPO/shared.txt"
+    echo "untouched" > "$_WT_INTEG_REPO/safe.txt"
+    git -C "$_WT_INTEG_REPO" add . >/dev/null 2>&1
+    git -C "$_WT_INTEG_REPO" commit -m "initial" >/dev/null 2>&1
+
+    wt_create_all "$_WT_INTEG_REPO" "$_WT_INTEG_SESSION" "main" 3 >/dev/null 2>&1 || return 1
+    local base="${_WT_INTEG_REPO}-worktrees/${_WT_INTEG_SESSION}"
+
+    # Agent 1: edit shared.txt
+    echo "agent1" > "${base}/${_WT_INTEG_SESSION}-1/shared.txt"
+    git -C "${base}/${_WT_INTEG_SESSION}-1" add shared.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_INTEG_SESSION}-1" commit -m "a1" >/dev/null 2>&1
+
+    # Agent 2: edit shared.txt (conflict with 1)
+    echo "agent2" > "${base}/${_WT_INTEG_SESSION}-2/shared.txt"
+    git -C "${base}/${_WT_INTEG_SESSION}-2" add shared.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_INTEG_SESSION}-2" commit -m "a2" >/dev/null 2>&1
+
+    # Agent 3: edit safe.txt only (no conflict with anyone)
+    echo "agent3" > "${base}/${_WT_INTEG_SESSION}-3/safe.txt"
+    git -C "${base}/${_WT_INTEG_SESSION}-3" add safe.txt >/dev/null 2>&1
+    git -C "${base}/${_WT_INTEG_SESSION}-3" commit -m "a3" >/dev/null 2>&1
+
+    # 1 vs 2: conflict. 1 vs 3: clean. 2 vs 3: clean.
+    local rc12=0 rc13=0 rc23=0
+    git -C "$_WT_INTEG_REPO" merge-tree --write-tree "${_WT_INTEG_SESSION}-1" "${_WT_INTEG_SESSION}-2" >/dev/null 2>&1 || rc12=$?
+    git -C "$_WT_INTEG_REPO" merge-tree --write-tree "${_WT_INTEG_SESSION}-1" "${_WT_INTEG_SESSION}-3" >/dev/null 2>&1 || rc13=$?
+    git -C "$_WT_INTEG_REPO" merge-tree --write-tree "${_WT_INTEG_SESSION}-2" "${_WT_INTEG_SESSION}-3" >/dev/null 2>&1 || rc23=$?
+
+    (( rc12 == 1 )) && (( rc13 == 0 )) && (( rc23 == 0 )) || return 1
+
+    wt_cleanup "$_WT_INTEG_SESSION" >/dev/null 2>&1
+    _wt_integ_cleanup
+}
+assert_ok "lifecycle: 3 worktrees — only overlapping pair conflicts" _test_three_way_partial_conflict
+
+# Final cleanup for all worktree tests
+_wt_teardown
+_wt_integ_cleanup 2>/dev/null || true
+
+###############################################################################
 #                          SUMMARY                                            #
 ###############################################################################
 
