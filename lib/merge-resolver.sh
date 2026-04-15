@@ -43,10 +43,37 @@ audit_merge() {
 # When idle, the pane shows a short line with ❯ (no typed text after it).
 # The ❯ line uses a non-breaking space (\xc2\xa0) so we match by line
 # length (<10 chars) rather than exact whitespace.
+#
+# IMPORTANT: Claude Code always shows the ❯ input prompt at the bottom of its
+# TUI, even while the model is actively thinking. To avoid false positives, we
+# also check for processing indicators — the thinking spinner shows patterns
+# like "· Hullaballooing…" or "* Actioning…" while the model is working.
 agent_is_idle() {
     local pane="$1"
     local content
     content="$(tmux capture-pane -t "$pane" -p 2>/dev/null)" || return 1
+
+    # Veto: Claude Code thinking/processing spinner is visible.
+    # During model processing the TUI shows lines like:
+    #   · Hullaballooing…   * Actioning…   ✶ Envisioning… (23s · ↑ 327 tokens)
+    # The spinner character varies (·, *, ✶, etc.) so we match the general
+    # shape: 1-4 non-space chars, a space, a capitalized word, then …
+    if echo "$content" | grep -qE '^\S{1,4} [A-Z][a-z]+.{0,5}…'; then
+        return 1
+    fi
+
+    local tail20
+    tail20="$(echo "$content" | tail -20)"
+
+    # Veto: a permission prompt is visible (Allow/Deny or Yes/No).
+    # The agent is waiting for tool approval — the approver daemon will handle it.
+    if echo "$tail20" | grep -qi 'Allow' && echo "$tail20" | grep -qi 'Deny'; then
+        return 1
+    fi
+    if echo "$tail20" | grep -qE '[0-9]+\.\s*Yes' && echo "$tail20" | grep -qE '[0-9]+\.\s*No'; then
+        return 1
+    fi
+
     local tail10
     tail10="$(echo "$content" | tail -10)"
     echo "$tail10" | awk '/❯/ && length < 10 { found=1 } END { exit !found }'
@@ -54,6 +81,13 @@ agent_is_idle() {
 
 wait_for_agents() {
     local count="$1"
+    local start_time
+    start_time="$(date +%s)"
+
+    # Grace period: don't check idle state until agents have had time to start
+    # processing. Claude Code shows the ❯ prompt immediately on startup
+    # (before the model responds), so checking too early causes false positives.
+    local STARTUP_GRACE=15
 
     echo "Waiting for $count agent(s) to finish..."
     echo ""
@@ -63,10 +97,18 @@ wait_for_agents() {
 
     while true; do
         local done_count=0
+        local now
+        now="$(date +%s)"
+
         for (( i=1; i<=count; i++ )); do
             # Already done (marker exists)
             if [[ -f "$(wt_done_marker "$SESSION_NAME" "$i")" ]]; then
                 done_count=$((done_count + 1))
+                continue
+            fi
+
+            # Skip idle detection during startup grace period
+            if (( now - start_time < STARTUP_GRACE )); then
                 continue
             fi
 
@@ -165,14 +207,23 @@ Do NOT modify files that are not in the conflicted list above."
 
     tmux send-keys -t "$SESSION_NAME:$resolve_win" "$cmd" C-m
 
-    # Wait for resolver to finish — detect idle prompt and send /exit
+    # Wait for resolver to finish — detect idle prompt and send /exit.
+    # Grace period: the resolver needs time to start processing before we
+    # check idle state (same TUI false-positive issue as agent_is_idle).
     local resolve_exited=0
+    local resolve_start
+    resolve_start="$(date +%s)"
+    local RESOLVE_GRACE=45
+
     while [[ ! -f "$resolve_done" ]]; do
         if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
             rm -f "$tmpfile"
             return 1
         fi
-        if (( ! resolve_exited )) && agent_is_idle "$SESSION_NAME:$resolve_win"; then
+        local now
+        now="$(date +%s)"
+        if (( ! resolve_exited )) && (( now - resolve_start >= RESOLVE_GRACE )) && \
+           agent_is_idle "$SESSION_NAME:$resolve_win"; then
             tmux send-keys -t "$SESSION_NAME:$resolve_win" "/exit" C-m 2>/dev/null || true
             resolve_exited=1
             audit_merge "Resolver finished, sent /exit"
@@ -190,16 +241,26 @@ Do NOT modify files that are not in the conflicted list above."
         git -C "$REPO_DIR" commit --no-edit 2>/dev/null || true
     fi
 
-    # Check if conflicts are resolved
+    # Check if conflicts are resolved — both git-level and leftover markers
     local remaining
     remaining="$(git -C "$REPO_DIR" diff --name-only --diff-filter=U 2>/dev/null)"
-    if [[ -z "$remaining" ]]; then
-        audit_merge "OK Conflicts resolved for $branch"
-        return 0
+    if [[ -n "$remaining" ]]; then
+        audit_merge "FAILED Unresolved conflicts remain: $(echo "$remaining" | tr '\n' ' ')"
+        return 1
     fi
 
-    audit_merge "FAILED Unresolved conflicts remain: $(echo "$remaining" | tr '\n' ' ')"
-    return 1
+    # Also check for leftover conflict markers in tracked files.
+    # After auto-commit, git considers the merge resolved even if markers remain.
+    local marker_files
+    marker_files="$(git -C "$REPO_DIR" grep -l '^<<<<<<<\|^=======$\|^>>>>>>>' HEAD -- 2>/dev/null | head -20)" || true
+    if [[ -n "$marker_files" ]]; then
+        audit_merge "WARN Conflict markers still present in: $(echo "$marker_files" | tr '\n' ' ')"
+        audit_merge "FAILED Resolution incomplete for $branch — conflict markers remain"
+        return 1
+    fi
+
+    audit_merge "OK Conflicts resolved for $branch"
+    return 0
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
