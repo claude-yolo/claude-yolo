@@ -40,17 +40,16 @@ audit_merge() {
 
 # Detect if an agent pane is idle (Claude finished work, showing ❯ prompt).
 # Returns 0 if idle, 1 otherwise.
-# When idle, the pane shows a short line with ❯ (no typed text after it)
-# and "? for shortcuts" nearby. The ❯ line uses a non-breaking space (\xc2\xa0)
-# so we match by line length (<10 chars) rather than exact whitespace.
+# When idle, the pane shows a short line with ❯ (no typed text after it).
+# The ❯ line uses a non-breaking space (\xc2\xa0) so we match by line
+# length (<10 chars) rather than exact whitespace.
 agent_is_idle() {
     local pane="$1"
     local content
     content="$(tmux capture-pane -t "$pane" -p 2>/dev/null)" || return 1
-    local tail5
-    tail5="$(echo "$content" | tail -5)"
-    echo "$tail5" | awk '/❯/ && length < 10 { found=1 } END { exit !found }' && \
-    echo "$tail5" | grep -q 'for shortcuts'
+    local tail10
+    tail10="$(echo "$content" | tail -10)"
+    echo "$tail10" | awk '/❯/ && length < 10 { found=1 } END { exit !found }'
 }
 
 wait_for_agents() {
@@ -183,6 +182,13 @@ Do NOT modify files that are not in the conflicted list above."
 
     tmux kill-window -t "$SESSION_NAME:$resolve_win" 2>/dev/null || true
     rm -f "$tmpfile" "$resolve_done"
+
+    # Auto-commit in case the resolver edited files but the commit failed or was skipped
+    if [[ -n "$(git -C "$REPO_DIR" diff --name-only 2>/dev/null)" ]]; then
+        audit_merge "Resolver left uncommitted changes — auto-committing"
+        git -C "$REPO_DIR" add -A 2>/dev/null
+        git -C "$REPO_DIR" commit --no-edit 2>/dev/null || true
+    fi
 
     # Check if conflicts are resolved
     local remaining
