@@ -15,6 +15,7 @@ When organization-managed settings force `ask` mode for tools like `Bash`, `Bash
 - [Quick start](#quick-start)
 - [Worktree mode](#worktree-mode)
 - [Navigation](#navigation)
+- [Control commands](#control-commands)
 - [Options](#options)
 - [How it works](#how-it-works)
   - [Detection signals](#detection-signals)
@@ -76,7 +77,7 @@ claude-yolo -m opus "refactor the API layer"
 claude-yolo -d /path/to/project "run the test suite and fix failures"
 ```
 
-Once launched, you're inside a tmux session with one window per agent. The last window (`control`) tails the audit log in real time.
+Once launched, you're inside a tmux session with one window per agent. The last window (`control`) tails the audit log in real time and accepts slash commands.
 
 ## Worktree mode
 
@@ -134,6 +135,26 @@ See [docs/worktree-mode-demo.md](docs/worktree-mode-demo.md) for a full walkthro
 
 Re-attach later with `claude-yolo -r` (or `claude-yolo --resume`).
 
+## Control commands
+
+The `control` window accepts slash commands while continuing to show the audit log.
+
+```bash
+/loop 1h Continue experiments and push best submission
+```
+
+Available commands:
+
+| Command | Action |
+|---|---|
+| `/loop <interval> <prompt>` | Send `<prompt>` to `agent-1` immediately, then every interval until canceled |
+| `/loops` | List active loops |
+| `/loops cancel <id>` | Cancel one loop |
+| `/help` | Show command help |
+
+Intervals are whole numbers with `s`, `m`, `h`, or `d`, for example `30s`, `15m`, `1h`, or `1d`.
+`/loop` is disabled in worktree mode because agent windows may exit after completing their assigned task.
+
 ## Options
 
 ```
@@ -159,13 +180,14 @@ install.sh options:
 ## How it works
 
 1. **Launcher** (`claude-yolo`) creates a tmux session and spawns one window per task, each running `claude`.
-2. **Approver daemon** (`lib/approver-daemon.sh`) runs in the background, polling every 0.3s. For each pane it:
+2. **Control pane** (`lib/control-pane.sh`) opens the `control` window, tails the audit log, and handles slash commands such as `/loop`.
+3. **Approver daemon** (`lib/approver-daemon.sh`) runs in the background, polling every 0.3s. For each pane it:
    - Captures visible content via `tmux capture-pane`
    - Detects three prompt styles (see below)
    - Sends `Enter` via `tmux send-keys` to confirm the pre-selected option
    - If the transcript is collapsed (`● Bash(...)` visible but prompt hidden), sends `Ctrl+O` to expand it first — the next poll cycle then approves
    - Applies a 2-second per-pane cooldown to prevent double-approvals
-3. **Audit log** at `/tmp/claude-yolo-<session>.log` records every approval with timestamp, pane ID, and matched pattern. Each session gets its own log, so concurrent claude-yolo processes don't interfere.
+4. **Audit log** at `/tmp/claude-yolo-<session>.log` records every approval and control event with timestamps. Each session gets its own log, so concurrent claude-yolo processes don't interfere.
 
 ### Worktree pipeline
 
@@ -203,11 +225,12 @@ When a collapsed view is detected, the daemon sends `Ctrl+O` to expand it, then 
 claude-yolo              # Main launcher script
 lib/
   common.sh              # Logging, prerequisite checks, git helpers
+  control-pane.sh        # Interactive control window + slash command scheduler
   approver-daemon.sh     # tmux capture-pane monitor + auto-approver
   worktree-manager.sh    # Git worktree lifecycle (create, list, cleanup)
   conflict-daemon.sh     # Real-time conflict detection via git merge-tree
   merge-resolver.sh      # Sequential merge + Claude-powered conflict resolution
-test_approver.sh         # Test suite (211 tests)
+test_approver.sh         # Test suite (226 tests)
 docs/
   worktree-mode-demo.md  # Step-by-step demo with Ubuntu 24.04 container
 ```
@@ -250,7 +273,7 @@ The test suite covers:
 - **Real-time conflict detection** — A background daemon polls `git merge-tree` across all branch pairs and logs conflicts as they emerge.
 - **Automated conflict resolution** — On merge conflict, a Claude agent is spawned to read both sides, resolve conflict markers, and commit the merge.
 - **Sophisticated detection logic** — Handles both expanded and collapsed transcript views without modifying the Claude CLI or relying on the `--dangerously-skip-permissions` flag.
-- **Reliability and traceability** — Per-pane cooldowns, detailed audit logging, and 211 tests emphasize reliability and traceability.
+- **Reliability and traceability** — Per-pane cooldowns, detailed audit logging, and 226 tests emphasize reliability and traceability.
 - **No CLI patching or containerization** — Avoids direct CLI patching or containerization, suitable for environments where `ask` mode is enforced.
 
 ## Development history
