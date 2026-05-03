@@ -15,8 +15,31 @@ PASS=0 FAIL=0 SKIP=0 TOTAL=0
 VERBOSE="${VERBOSE:-0}"
 FILTER="${1:-}"
 [[ "$FILTER" == "-v" ]] && { VERBOSE=1; FILTER="${2:-}"; }
+CURRENT_SECTION=""
+FAILURES=()
 
 _red=$'\033[0;31m' _green=$'\033[0;32m' _yellow=$'\033[0;33m' _reset=$'\033[0m'
+
+_print_block() {
+    local label="$1" content="$2"
+    if [[ -z "$content" ]]; then
+        echo "        $label: <empty>"
+        return 0
+    fi
+
+    echo "        $label:"
+    while IFS= read -r line; do
+        echo "          $line"
+    done <<< "$content"
+}
+
+_record_failure() {
+    local desc="$1" detail="${2:-}"
+    local section="$CURRENT_SECTION"
+    [[ -z "$section" ]] && section="(no section)"
+
+    FAILURES+=("$section :: $desc${detail:+ :: $detail}")
+}
 
 assert_ok() {
     local desc="$1"; shift
@@ -24,12 +47,21 @@ assert_ok() {
     if [[ -n "$FILTER" && "$desc" != *"$FILTER"* ]]; then
         SKIP=$((SKIP+1)); return 0
     fi
-    if "$@" >/dev/null 2>&1; then
+    local output output_file status
+    output_file="$(mktemp)"
+    "$@" >"$output_file" 2>&1
+    status=$?
+    output="$(cat "$output_file")"
+    rm -f "$output_file"
+    if (( status == 0 )); then
         PASS=$((PASS+1))
         (( VERBOSE )) && echo "  ${_green}PASS${_reset} $desc"
     else
         FAIL=$((FAIL+1))
         echo "  ${_red}FAIL${_reset} $desc"
+        echo "        exit status: $status"
+        _print_block "output" "$output"
+        _record_failure "$desc" "exit status $status"
     fi
 }
 
@@ -39,9 +71,17 @@ assert_fail() {
     if [[ -n "$FILTER" && "$desc" != *"$FILTER"* ]]; then
         SKIP=$((SKIP+1)); return 0
     fi
-    if "$@" >/dev/null 2>&1; then
+    local output output_file status
+    output_file="$(mktemp)"
+    "$@" >"$output_file" 2>&1
+    status=$?
+    output="$(cat "$output_file")"
+    rm -f "$output_file"
+    if (( status == 0 )); then
         FAIL=$((FAIL+1))
         echo "  ${_red}FAIL${_reset} $desc  (expected failure, got success)"
+        _print_block "output" "$output"
+        _record_failure "$desc" "expected failure, got success"
     else
         PASS=$((PASS+1))
         (( VERBOSE )) && echo "  ${_green}PASS${_reset} $desc"
@@ -62,6 +102,7 @@ assert_eq() {
         echo "  ${_red}FAIL${_reset} $desc"
         echo "        expected: $(printf '%q' "$expected")"
         echo "        actual:   $(printf '%q' "$actual")"
+        _record_failure "$desc" "expected $(printf '%q' "$expected"), actual $(printf '%q' "$actual")"
     fi
 }
 
@@ -78,10 +119,15 @@ assert_contains() {
         FAIL=$((FAIL+1))
         echo "  ${_red}FAIL${_reset} $desc"
         echo "        missing '$needle' in output"
+        _print_block "haystack" "$haystack"
+        _record_failure "$desc" "missing $(printf '%q' "$needle")"
     fi
 }
 
-section() { echo "${_yellow}▸ $1${_reset}"; }
+section() {
+    CURRENT_SECTION="$1"
+    echo "${_yellow}▸ $1${_reset}"
+}
 
 # ── source the units under test ──────────────────────────────────────────────
 
@@ -3188,6 +3234,11 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 if (( FAIL == 0 )); then
     echo "${_green}All $PASS tests passed${_reset} ($TOTAL total, $SKIP skipped)"
 else
+    echo "${_red}Failed tests:${_reset}"
+    for failure in "${FAILURES[@]}"; do
+        echo "  - $failure"
+    done
+    echo ""
     echo "${_red}$FAIL failed${_reset}, $PASS passed ($TOTAL total, $SKIP skipped)"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
