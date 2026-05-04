@@ -13,6 +13,8 @@ SESSION_NAME="${1:?Usage: approver-daemon.sh <session-name> [poll-interval] [aud
 POLL_INTERVAL="${2:-0.3}"
 AUDIT_LOG="${3:-$(log_dir)/claude-yolo-${SESSION_NAME}.log}"
 COOLDOWN_SECS=2
+PLAN_APPROVAL_TTL="${CLAUDE_YOLO_PLAN_APPROVAL_TTL:-3600}"
+SLASH_APPROVAL_TTL="${CLAUDE_YOLO_SLASH_APPROVAL_TTL:-60}"
 
 # Associative array tracking last-approval timestamp per pane
 declare -A LAST_APPROVED
@@ -95,6 +97,130 @@ detect_prompt() {
     return 1
 }
 
+# Detect the ExitPlanMode approval prompt that Claude Code shows when an agent
+# finishes plan mode. Pattern looks like:
+#   ⏵⏵ Would you like to proceed with this plan?
+#   ❯ 1. Yes, and auto-accept edits
+#     2. Yes, and manually approve edits
+#     3. No, keep planning
+#
+# Three signals required to distinguish a plan-exit prompt from a generic
+# tool-permission prompt:
+#   - plan-context phrase ("proceed with this plan", "ExitPlanMode", "plan mode" etc.)
+#   - approval option ("Yes, and auto-accept", "Yes, and manually approve", ...)
+#   - denial/keep-planning option ("No, keep planning", ...)
+detect_plan_prompt() {
+    local content="$1"
+
+    local tail_content
+    tail_content="$(echo "$content" | tail -n 35)"
+
+    local has_plan=0 has_approval_option=0 has_context=0
+
+    if echo "$tail_content" | grep -qiE '(proceed with (this )?plan|exit plan mode|implement (this )?plan|approve (this )?plan|plan mode|ExitPlanMode|^ *plan:)'; then
+        has_plan=1
+    fi
+
+    if echo "$tail_content" | grep -qiE '^[[:space:]]*((❯|›)[[:space:]]*)?([0-9]+[.)][[:space:]]*)?(Yes,? (and )?(auto-accept|manually approve|proceed|implement|clear context and implement)|Proceed|Implement|Approve|Continue)([[:space:]]|$)'; then
+        has_approval_option=1
+    fi
+
+    if echo "$tail_content" | grep -qiE '^[[:space:]]*((❯|›)[[:space:]]*)?([0-9]+[.)][[:space:]]*)?(No,?[[:space:]]*keep planning|Keep planning|No,? but|Go back|Cancel|Revise|.*do differently)'; then
+        has_context=1
+    fi
+
+    if (( has_plan && has_approval_option && has_context )); then
+        echo "plan"
+        return 0
+    fi
+
+    return 1
+}
+
+# Marker file used by control-pane.sh to scope plan-mode auto-approval to a
+# specific pane. The daemon reads "<pane_id>\t<timestamp>" and only approves
+# plan-exit prompts when (a) the pane matches and (b) the timestamp is within
+# PLAN_APPROVAL_TTL.
+plan_approval_file() {
+    if [[ -n "${CLAUDE_YOLO_PLAN_APPROVAL_FILE:-}" ]]; then
+        printf '%s\n' "$CLAUDE_YOLO_PLAN_APPROVAL_FILE"
+        return 0
+    fi
+
+    [[ -n "${AUDIT_LOG:-}" ]] || return 1
+    printf '%s.plan-approval\n' "$AUDIT_LOG"
+}
+
+slash_approval_file() {
+    if [[ -n "${CLAUDE_YOLO_SLASH_APPROVAL_FILE:-}" ]]; then
+        printf '%s\n' "$CLAUDE_YOLO_SLASH_APPROVAL_FILE"
+        return 0
+    fi
+
+    [[ -n "${AUDIT_LOG:-}" ]] || return 1
+    printf '%s.slash-approval\n' "$AUDIT_LOG"
+}
+
+clear_plan_approval_marker() {
+    local marker
+    marker="$(plan_approval_file 2>/dev/null)" || return 0
+    rm -f "$marker" 2>/dev/null || true
+}
+
+clear_slash_approval_marker() {
+    local marker
+    marker="$(slash_approval_file 2>/dev/null)" || return 0
+    rm -f "$marker" 2>/dev/null || true
+}
+
+plan_approval_marker_valid() {
+    local pane="$1"
+    local marker marker_pane marker_ts now ttl
+
+    marker="$(plan_approval_file)" || return 1
+    [[ -f "$marker" ]] || return 1
+
+    IFS=$'\t ' read -r marker_pane marker_ts _ < "$marker" || return 1
+    if [[ -z "$marker_pane" || ! "$marker_ts" =~ ^[0-9]+$ ]]; then
+        rm -f "$marker" 2>/dev/null || true
+        return 1
+    fi
+
+    ttl="$PLAN_APPROVAL_TTL"
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=3600
+    now="$(date +%s)"
+    if (( now - marker_ts > ttl )); then
+        rm -f "$marker" 2>/dev/null || true
+        return 1
+    fi
+
+    [[ "$marker_pane" == "$pane" ]]
+}
+
+slash_approval_marker_valid() {
+    local pane="$1"
+    local marker marker_pane marker_ts now ttl
+
+    marker="$(slash_approval_file)" || return 1
+    [[ -f "$marker" ]] || return 1
+
+    IFS=$'\t ' read -r marker_pane marker_ts _ < "$marker" || return 1
+    if [[ -z "$marker_pane" || ! "$marker_ts" =~ ^[0-9]+$ ]]; then
+        rm -f "$marker" 2>/dev/null || true
+        return 1
+    fi
+
+    ttl="$SLASH_APPROVAL_TTL"
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=60
+    now="$(date +%s)"
+    if (( now - marker_ts > ttl )); then
+        rm -f "$marker" 2>/dev/null || true
+        return 1
+    fi
+
+    [[ "$marker_pane" == "$pane" ]]
+}
+
 # Detect if the slash command autocomplete picker is visible.
 # When the user types "/p" (or similar), Claude Code shows an autocomplete popup
 # with lines like:  /plan    Enter plan mode
@@ -175,8 +301,34 @@ main_loop() {
                 continue
             fi
 
-            # Detect permission prompt (expanded view)
+            # Plan-exit prompts are scoped to the control pane via the marker
+            # file. Without a valid marker we deliberately leave the prompt for
+            # the user, so user-initiated plan mode is not silently approved.
             local pattern
+            if pattern="$(detect_plan_prompt "$content")"; then
+                if plan_approval_marker_valid "$pane"; then
+                    tmux send-keys -t "$pane" Enter 2>/dev/null || continue
+                    clear_plan_approval_marker
+                    LAST_APPROVED["$pane"]="$(date +%s)"
+                    audit "$pane" "plan-control"
+                fi
+                continue
+            fi
+
+            # Slash-command confirmation prompts (e.g. /clear) issued from the
+            # control pane via /queue are auto-approved when the slash marker
+            # is set; otherwise the prompt waits for the user.
+            if slash_approval_marker_valid "$pane"; then
+                if pattern="$(detect_prompt "$content")"; then
+                    tmux send-keys -t "$pane" Enter 2>/dev/null || continue
+                    clear_slash_approval_marker
+                    LAST_APPROVED["$pane"]="$(date +%s)"
+                    audit "$pane" "slash-control+$pattern"
+                    continue
+                fi
+            fi
+
+            # Detect permission prompt (expanded view)
             if pattern="$(detect_prompt "$content")"; then
                 # Send Enter to confirm the pre-selected option
                 # (Style A: "Allow" is focused, Style B: "❯ 1. Yes" is focused)

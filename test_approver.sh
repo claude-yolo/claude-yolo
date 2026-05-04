@@ -135,7 +135,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 # Source detect_prompt, detect_collapsed and friends without running the daemon's main_loop.
 # We extract the functions only.
-eval "$(sed -n '/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p' "$SCRIPT_DIR/lib/approver-daemon.sh")"
+eval "$(sed -n '/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_plan_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p; /^plan_approval_file()/,/^}/p; /^slash_approval_file()/,/^}/p; /^clear_plan_approval_marker()/,/^}/p; /^clear_slash_approval_marker()/,/^}/p; /^plan_approval_marker_valid()/,/^}/p; /^slash_approval_marker_valid()/,/^}/p' "$SCRIPT_DIR/lib/approver-daemon.sh")"
 
 # Source build_agent_cmd from the launcher
 eval "$(sed -n '/^build_agent_cmd()/,/^}/p' "$SCRIPT_DIR/claude-yolo")"
@@ -3224,6 +3224,445 @@ assert_ok "lifecycle: 3 worktrees — only overlapping pair conflicts" _test_thr
 # Final cleanup for all worktree tests
 _wt_teardown
 _wt_integ_cleanup 2>/dev/null || true
+
+###############################################################################
+#               PLAN-EXIT PROMPT DETECTION                                    #
+###############################################################################
+
+section "detect_plan_prompt — Claude Code ExitPlanMode prompts"
+
+# Realistic ExitPlanMode prompt from Claude Code TUI
+make_plan_exit_prompt() {
+    cat <<'PANE'
+  ⏵⏵ ready to exit plan mode and start implementing
+  ⎿ User must approve the plan before tools can run
+
+ Would you like to proceed with this plan?
+ ❯ 1. Yes, and auto-accept edits
+   2. Yes, and manually approve edits
+   3. No, keep planning
+
+ Esc to cancel
+PANE
+}
+
+assert_ok "Plan: ExitPlanMode auto-accept variant" \
+    detect_plan_prompt "$(make_plan_exit_prompt)"
+
+assert_ok "Plan: numbered list with proceed-with-plan question" \
+    detect_plan_prompt "$(cat <<'PANE'
+ The agent is in plan mode.
+
+ Proceed with this plan?
+ ❯ 1. Yes, and auto-accept edits
+   2. No, keep planning
+PANE
+)"
+
+assert_ok "Plan: ExitPlanMode keyword present" \
+    detect_plan_prompt "$(cat <<'PANE'
+ ● ExitPlanMode(plan: refactor the parser)
+   Implement this plan?
+
+ ❯ 1. Yes, proceed
+   2. No, keep planning
+PANE
+)"
+
+# Negative: missing approval option text
+assert_fail "Plan: missing approval option" \
+    detect_plan_prompt "$(cat <<'PANE'
+ Would you like to proceed with this plan?
+ No options listed
+PANE
+)"
+
+# Negative: missing "no/keep planning" context
+assert_fail "Plan: missing keep-planning context" \
+    detect_plan_prompt "$(cat <<'PANE'
+ Would you like to proceed with this plan?
+ ❯ 1. Yes, proceed
+PANE
+)"
+
+# Negative: generic Yes/No prompt without plan context
+assert_fail "Plan: generic permission prompt is not a plan prompt" \
+    detect_plan_prompt "$(cat <<'PANE'
+ Bash command
+
+   ls /tmp
+   List current directory contents
+
+ Do you want to proceed?
+ > 1. Yes
+   2. No
+PANE
+)"
+
+# detect_slash_picker still vetoes in the daemon, but detect_plan_prompt itself
+# should not match a slash picker because the ExitPlanMode keywords are absent.
+assert_fail "Plan: slash picker is not a plan prompt" \
+    detect_plan_prompt "$(cat <<'PANE'
+   /plan          Enter plan mode
+ ❯ /permissions   Modify allowed tools
+   /clear         Clear conversation
+PANE
+)"
+
+###############################################################################
+#               PLAN-APPROVAL MARKER FILE VALIDATION                          #
+###############################################################################
+
+section "plan_approval_marker_valid — pane and TTL scoping"
+
+_marker_setup() {
+    AUDIT_LOG="$(mktemp)"
+    : > "$AUDIT_LOG"
+    PLAN_APPROVAL_TTL=3600
+    SLASH_APPROVAL_TTL=60
+}
+
+_marker_teardown() {
+    [[ -n "${AUDIT_LOG:-}" ]] && rm -f "$AUDIT_LOG" "$AUDIT_LOG.plan-approval" "$AUDIT_LOG.slash-approval" 2>/dev/null
+    AUDIT_LOG=""
+}
+
+_marker_setup
+_test_plan_marker_present_matching_pane() {
+    local f
+    f="$(plan_approval_file)"
+    printf '%%5\t%s\n' "$(date +%s)" > "$f"
+    plan_approval_marker_valid "%5"
+}
+assert_ok "plan marker: valid for matching pane" _test_plan_marker_present_matching_pane
+
+_test_plan_marker_present_other_pane() {
+    local f
+    f="$(plan_approval_file)"
+    printf '%%5\t%s\n' "$(date +%s)" > "$f"
+    plan_approval_marker_valid "%9"
+}
+assert_fail "plan marker: rejects mismatched pane" _test_plan_marker_present_other_pane
+
+_test_plan_marker_missing() {
+    rm -f "$(plan_approval_file)" 2>/dev/null
+    plan_approval_marker_valid "%5"
+}
+assert_fail "plan marker: missing marker is invalid" _test_plan_marker_missing
+
+_test_plan_marker_expired() {
+    local f stale
+    f="$(plan_approval_file)"
+    stale="$(($(date +%s) - PLAN_APPROVAL_TTL - 60))"
+    printf '%%5\t%s\n' "$stale" > "$f"
+    plan_approval_marker_valid "%5"
+}
+assert_fail "plan marker: expired TTL is invalid" _test_plan_marker_expired
+
+_test_plan_marker_expired_self_cleans() {
+    local f stale
+    f="$(plan_approval_file)"
+    stale="$(($(date +%s) - PLAN_APPROVAL_TTL - 60))"
+    printf '%%5\t%s\n' "$stale" > "$f"
+    plan_approval_marker_valid "%5" >/dev/null 2>&1
+    [[ ! -f "$f" ]]
+}
+assert_ok "plan marker: expired marker is removed" _test_plan_marker_expired_self_cleans
+
+_test_plan_marker_malformed() {
+    local f
+    f="$(plan_approval_file)"
+    printf 'garbage\n' > "$f"
+    plan_approval_marker_valid "%5"
+}
+assert_fail "plan marker: malformed marker is invalid" _test_plan_marker_malformed
+
+_test_clear_plan_marker() {
+    local f
+    f="$(plan_approval_file)"
+    printf '%%5\t%s\n' "$(date +%s)" > "$f"
+    clear_plan_approval_marker
+    [[ ! -f "$f" ]]
+}
+assert_ok "plan marker: clear_plan_approval_marker removes file" _test_clear_plan_marker
+
+# Slash marker uses 60s TTL by default
+_test_slash_marker_within_ttl() {
+    local f
+    f="$(slash_approval_file)"
+    printf '%%5\t%s\n' "$(date +%s)" > "$f"
+    slash_approval_marker_valid "%5"
+}
+assert_ok "slash marker: valid for matching pane" _test_slash_marker_within_ttl
+
+_test_slash_marker_expired() {
+    local f stale
+    f="$(slash_approval_file)"
+    stale="$(($(date +%s) - SLASH_APPROVAL_TTL - 5))"
+    printf '%%5\t%s\n' "$stale" > "$f"
+    slash_approval_marker_valid "%5"
+}
+assert_fail "slash marker: expired TTL is invalid" _test_slash_marker_expired
+
+_test_slash_marker_pane_mismatch() {
+    local f
+    f="$(slash_approval_file)"
+    printf '%%5\t%s\n' "$(date +%s)" > "$f"
+    slash_approval_marker_valid "%9"
+}
+assert_fail "slash marker: rejects mismatched pane" _test_slash_marker_pane_mismatch
+
+_marker_teardown
+
+###############################################################################
+#               CONTROL PANE — RECOGNIZERS                                    #
+###############################################################################
+
+section "control-pane — /plan and /queue recognizers"
+
+assert_ok "control_is_plan_command: bare /plan" \
+    control_is_plan_command "/plan"
+
+assert_ok "control_is_plan_command: /plan with prompt" \
+    control_is_plan_command "/plan refactor the parser"
+
+assert_fail "control_is_plan_command: /planet is not /plan" \
+    control_is_plan_command "/planet earth"
+
+assert_fail "control_is_plan_command: /loop is not /plan" \
+    control_is_plan_command "/loop 1h test"
+
+assert_ok "control_is_queue_command: bare /queue" \
+    control_is_queue_command "/queue"
+
+assert_ok "control_is_queue_command: /queue with array" \
+    control_is_queue_command '/queue ["one", "two"]'
+
+assert_fail "control_is_queue_command: /queues plural is not /queue" \
+    control_is_queue_command "/queues"
+
+###############################################################################
+#               CONTROL PANE — QUEUE ARRAY PARSING                            #
+###############################################################################
+
+section "control-pane — /queue array parsing"
+
+_test_queue_parse_simple() {
+    control_parse_queue_items '["one", "two"]' || return 1
+    [[ "${#CONTROL_QUEUE_PARSED_ITEMS[@]}" -eq 2 ]] || return 1
+    [[ "${CONTROL_QUEUE_PARSED_ITEMS[0]}" == "one" && "${CONTROL_QUEUE_PARSED_ITEMS[1]}" == "two" ]]
+}
+assert_ok "queue parse: two double-quoted strings" _test_queue_parse_simple
+
+_test_queue_parse_single_quoted() {
+    control_parse_queue_items "['alpha', 'beta']" || return 1
+    [[ "${#CONTROL_QUEUE_PARSED_ITEMS[@]}" -eq 2 ]] || return 1
+    [[ "${CONTROL_QUEUE_PARSED_ITEMS[0]}" == "alpha" && "${CONTROL_QUEUE_PARSED_ITEMS[1]}" == "beta" ]]
+}
+assert_ok "queue parse: single-quoted strings" _test_queue_parse_single_quoted
+
+_test_queue_parse_triple_quoted() {
+    local input
+    input='["""line one
+line two""", "single"]'
+    control_parse_queue_items "$input" || return 1
+    [[ "${#CONTROL_QUEUE_PARSED_ITEMS[@]}" -eq 2 ]] || return 1
+    [[ "${CONTROL_QUEUE_PARSED_ITEMS[0]}" == $'line one\nline two' ]] || return 1
+    [[ "${CONTROL_QUEUE_PARSED_ITEMS[1]}" == "single" ]]
+}
+assert_ok "queue parse: triple-quoted multi-line strings" _test_queue_parse_triple_quoted
+
+assert_fail "queue parse: rejects empty []" \
+    control_parse_queue_items '[]'
+
+assert_fail "queue parse: rejects trailing comma" \
+    control_parse_queue_items '["one",]'
+
+assert_fail "queue parse: rejects unquoted item" \
+    control_parse_queue_items '[one]'
+
+assert_fail "queue parse: rejects bare text" \
+    control_parse_queue_items 'just text'
+
+# control_queue_array_needs_more: true when the [ has no matching ]
+_test_queue_array_needs_more_open() {
+    control_queue_array_needs_more '["start without end'
+}
+assert_ok "queue array_needs_more: bracket open" _test_queue_array_needs_more_open
+
+_test_queue_array_needs_more_closed() {
+    control_queue_array_needs_more '["complete"]'
+}
+assert_fail "queue array_needs_more: bracket already closed" _test_queue_array_needs_more_closed
+
+###############################################################################
+#               CONTROL PANE — QUEUE STATE ROUND-TRIP                         #
+###############################################################################
+
+section "control-pane — queue state on disk"
+
+_test_queue_init_round_trip() {
+    local dir
+    dir="$(mktemp -d)"
+    local items=("first" "second" "third")
+    control_queue_init_state "$dir" items || { rm -rf "$dir"; return 1; }
+    [[ "$(cat "$dir/status")" == "pending" ]] || { rm -rf "$dir"; return 1; }
+    [[ "$(cat "$dir/next_pos")" == "1" ]] || { rm -rf "$dir"; return 1; }
+
+    local order=()
+    control_queue_read_order "$dir" order || { rm -rf "$dir"; return 1; }
+    [[ "${#order[@]}" -eq 3 ]] || { rm -rf "$dir"; return 1; }
+
+    [[ "$(cat "$dir/items/${order[0]}")" == "first" ]] || { rm -rf "$dir"; return 1; }
+    [[ "$(cat "$dir/items/${order[2]}")" == "third" ]] || { rm -rf "$dir"; return 1; }
+
+    rm -rf "$dir"
+}
+assert_ok "queue state: init writes order, items, status" _test_queue_init_round_trip
+
+_test_queue_remove_position() {
+    local dir
+    dir="$(mktemp -d)"
+    local items=("a" "b" "c" "d")
+    control_queue_init_state "$dir" items || { rm -rf "$dir"; return 1; }
+    control_queue_remove_positions_unlocked "$dir" 2 3 || { rm -rf "$dir"; return 1; }
+
+    local order=()
+    control_queue_read_order "$dir" order || { rm -rf "$dir"; return 1; }
+    [[ "${#order[@]}" -eq 2 ]] || { rm -rf "$dir"; return 1; }
+    [[ "$(cat "$dir/items/${order[0]}")" == "a" ]] || { rm -rf "$dir"; return 1; }
+    [[ "$(cat "$dir/items/${order[1]}")" == "d" ]] || { rm -rf "$dir"; return 1; }
+
+    rm -rf "$dir"
+}
+assert_ok "queue state: remove positions 2-3 leaves a, d" _test_queue_remove_position
+
+_test_queue_remove_running_item_blocked() {
+    local dir
+    dir="$(mktemp -d)"
+    local items=("a" "b" "c")
+    control_queue_init_state "$dir" items || { rm -rf "$dir"; return 1; }
+    # Mark item 2 as the one currently running.
+    printf '2\n' > "$dir/current_pos"
+    printf '3\n' > "$dir/next_pos"
+
+    # Removing position 2 (the running item) must fail with rc=2.
+    control_queue_remove_positions_unlocked "$dir" 2 2
+    local rc=$?
+    rm -rf "$dir"
+    (( rc == 2 ))
+}
+assert_ok "queue state: cannot remove the running item" _test_queue_remove_running_item_blocked
+
+_test_queue_pending_index_allowed() {
+    local dir
+    dir="$(mktemp -d)"
+    local items=("a" "b" "c")
+    control_queue_init_state "$dir" items || { rm -rf "$dir"; return 1; }
+
+    control_queue_pending_index_allowed_unlocked "$dir" 1 || { rm -rf "$dir"; return 1; }
+
+    # After the queue is "done", no index is allowed
+    printf 'done\n' > "$dir/status"
+    local rc=0
+    control_queue_pending_index_allowed_unlocked "$dir" 1 || rc=$?
+    rm -rf "$dir"
+    (( rc != 0 ))
+}
+assert_ok "queue state: pending index allowed before done" _test_queue_pending_index_allowed
+
+###############################################################################
+#               CONTROL PANE — /loop /queue and /loop /plan ROUTING            #
+###############################################################################
+
+section "control-pane — /loop /queue and /loop /plan dispatch"
+
+_LOOP_ROUTE_AUDIT="/tmp/claude-yolo-loop-route-test-$$.log"
+
+_test_start_loop_routes_queue() {
+    local audit calls captured_args
+    audit="$(mktemp)"
+    calls="$(mktemp)"
+
+    SESSION_NAME="route-test"
+    AUDIT_LOG="$audit"
+    SESSION_MODE="standard"
+    LOOP_PIDS=(); LOOP_INTERVALS=(); LOOP_SECONDS=(); LOOP_PROMPTS=(); LOOP_TARGETS=(); LOOP_TYPES=(); LOOP_QUEUE_IDS=()
+    QUEUE_PIDS=(); QUEUE_INTERVALS=(); QUEUE_SECONDS=(); QUEUE_TARGETS=(); QUEUE_TYPES=(); QUEUE_STATE_DIRS=(); QUEUE_LOOP_IDS=()
+    NEXT_LOOP_ID=1; NEXT_QUEUE_ID=1
+
+    # Stub control_agent_exists / control_start_queue / control_loop_worker
+    control_agent_exists() { return 0; }
+    control_start_queue() {
+        printf 'start_queue type=%s items_var=%s interval=%s seconds=%s loop_id=%s display=%s\n' \
+            "$1" "$2" "${3:-}" "${4:-}" "${5:-}" "${6:-}" >> "$calls"
+    }
+    control_loop_worker() {
+        printf 'loop_worker type=%s\n' "${8:-prompt}" >> "$calls"
+    }
+
+    control_start_loop "30s" "30" '/queue ["alpha", "beta"]' >/dev/null
+    captured_args="$(cat "$calls")"
+    rm -f "$audit" "$calls"
+    [[ "$captured_args" == *"start_queue type=loop items_var=CONTROL_QUEUE_PARSED_ITEMS"* ]] || return 1
+    [[ "$captured_args" != *"loop_worker"* ]]
+}
+assert_ok "control-pane: /loop /queue routes to control_start_queue" _test_start_loop_routes_queue
+
+_test_start_loop_routes_plan_loop_type() {
+    local audit calls captured_args pid
+    audit="$(mktemp)"
+    calls="$(mktemp)"
+
+    SESSION_NAME="route-test"
+    AUDIT_LOG="$audit"
+    SESSION_MODE="standard"
+    LOOP_PIDS=(); LOOP_INTERVALS=(); LOOP_SECONDS=(); LOOP_PROMPTS=(); LOOP_TARGETS=(); LOOP_TYPES=(); LOOP_QUEUE_IDS=()
+    NEXT_LOOP_ID=1
+
+    control_agent_exists() { return 0; }
+    control_loop_worker() {
+        printf 'loop_worker type=%s prompt=%s\n' "${8:-prompt}" "${7:-}" >> "$calls"
+    }
+
+    control_start_loop "1h" "3600" "/plan refactor the parser" >/dev/null
+    captured_args="$(cat "$calls")"
+    rm -f "$audit" "$calls"
+
+    [[ "$captured_args" == *"loop_worker type=plan prompt=/plan refactor the parser"* ]] || return 1
+    [[ "${LOOP_TYPES[1]:-}" == "plan" ]]
+}
+assert_ok "control-pane: /loop /plan sets loop_type=plan" _test_start_loop_routes_plan_loop_type
+
+_test_start_loop_routes_plain_prompt() {
+    local audit calls captured_args
+    audit="$(mktemp)"
+    calls="$(mktemp)"
+
+    SESSION_NAME="route-test"
+    AUDIT_LOG="$audit"
+    SESSION_MODE="standard"
+    LOOP_PIDS=(); LOOP_INTERVALS=(); LOOP_SECONDS=(); LOOP_PROMPTS=(); LOOP_TARGETS=(); LOOP_TYPES=(); LOOP_QUEUE_IDS=()
+    NEXT_LOOP_ID=1
+
+    control_agent_exists() { return 0; }
+    control_loop_worker() {
+        printf 'loop_worker type=%s\n' "${8:-prompt}" >> "$calls"
+    }
+
+    control_start_loop "5s" "5" "Continue experiments" >/dev/null
+    captured_args="$(cat "$calls")"
+    rm -f "$audit" "$calls"
+
+    [[ "$captured_args" == *"loop_worker type=prompt"* ]] || return 1
+    [[ "${LOOP_TYPES[1]:-}" == "prompt" ]]
+}
+assert_ok "control-pane: /loop with bare prompt uses loop_type=prompt" _test_start_loop_routes_plain_prompt
+
+# Restore real implementations so later tests are unaffected
+unset -f control_agent_exists control_start_queue control_loop_worker 2>/dev/null
+source "$SCRIPT_DIR/lib/control-pane.sh" "" "" "standard"
+rm -f "$_LOOP_ROUTE_AUDIT"
 
 ###############################################################################
 #                          SUMMARY                                            #

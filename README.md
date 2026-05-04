@@ -137,23 +137,58 @@ Re-attach later with `claude-yolo -r` (or `claude-yolo --resume`).
 
 ## Control commands
 
-The `control` window accepts slash commands while continuing to show the audit log.
+The `control` window accepts slash commands while continuing to show the audit log. Up-arrow recalls earlier commands.
 
 ```bash
 /loop 1h Continue experiments and push best submission
+/queue ["read README.md", "summarize it", "/clear"]
+/plan refactor the parser
+/loop 30m /queue ["check status", "summarize"]
+/loop 1h /plan run the daily checks
 ```
 
 Available commands:
 
 | Command | Action |
 |---|---|
+| `/plan [prompt]` | Send `/plan <prompt>` to `agent-1` and auto-approve the resulting ExitPlanMode prompt for that send |
+| `/queue ["item1", "item2"]` | Run queued prompts/slash commands sequentially in `agent-1` |
+| `/queue add <id> ["item"]` | Append pending items to an existing queue |
+| `/queue edit <id> <n> ["item"]` | Replace one pending queue item |
+| `/queue remove <id> <n\|a-b>` | Remove pending queue item(s) |
+| `/queue dequeue <id>` | Remove the next pending item from a queue |
+| `/queue show <id>` | Show items in a queue and their status |
+| `/queues` | List active queues |
+| `/queues cancel <id>` | Cancel a queue |
 | `/loop <interval> <prompt>` | Send `<prompt>` to `agent-1` immediately, then every interval until canceled |
+| `/loop <interval> /queue [...]` | Re-run a queue every interval |
+| `/loop <interval> /plan <prompt>` | Run `/plan <prompt>` every interval, with auto-approval each cycle |
 | `/loops` | List active loops |
 | `/loops cancel <id>` | Cancel one loop |
 | `/help` | Show command help |
 
 Intervals are whole numbers with `s`, `m`, `h`, or `d`, for example `30s`, `15m`, `1h`, or `1d`.
-`/loop` is disabled in worktree mode because agent windows may exit after completing their assigned task.
+`/loop`, `/queue`, and `/plan` are disabled in worktree mode because agent windows may exit after completing their assigned task.
+
+### Plan-mode auto-approval is scoped
+
+`/plan` from the control pane drops a marker file (`<audit-log>.plan-approval`) tagged with the agent pane id and a timestamp. The approver daemon only auto-confirms an ExitPlanMode prompt when the marker matches the pane and is within `CLAUDE_YOLO_PLAN_APPROVAL_TTL` seconds (default 3600). User-initiated plan mode in the agent window does **not** get auto-approved — the prompt waits for the user.
+
+Slash commands queued via `/queue` use a similar scoped marker (`<audit-log>.slash-approval`, default TTL 60 s, override with `CLAUDE_YOLO_SLASH_APPROVAL_TTL`).
+
+### Tunable env vars
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLAUDE_YOLO_CONTROL_SUBMIT_DELAY` | `0.2` | Pause after pasting a one-line prompt before sending Enter |
+| `CLAUDE_YOLO_CONTROL_MULTILINE_PASTE_DELAY` | `0.8` | Pause after a multi-line paste before sending Enter |
+| `CLAUDE_YOLO_CONTROL_PLAN_PASTE` | `auto` | `1`/`0` to force-enable/disable continuation-line capture for `/plan` and `/loop` payloads pasted from the terminal |
+| `CLAUDE_YOLO_CONTROL_PLAN_PASTE_GRACE` | `0.5` | Grace window for collecting pasted continuation lines |
+| `CLAUDE_YOLO_CONTROL_QUEUE_WAIT_DELAY` | `1` | Poll interval while waiting for `agent-1` to return to idle between queue items |
+| `CLAUDE_YOLO_CONTROL_QUEUE_POST_SEND_GRACE` | `0.5` | Pause after sending a queue item before the idle wait begins |
+| `CLAUDE_YOLO_CONTROL_QUEUE_LOCK_DELAY` | `0.05` | Backoff while contending for the queue state lock |
+| `CLAUDE_YOLO_PLAN_APPROVAL_TTL` | `3600` | TTL (seconds) for the plan-approval marker |
+| `CLAUDE_YOLO_SLASH_APPROVAL_TTL` | `60` | TTL (seconds) for the slash-approval marker |
 
 ## Options
 
