@@ -23,6 +23,21 @@ log_error() {
     printf "${_RED}[%s ERROR]${_RESET} %s\n" "$(date '+%H:%M:%S')" "$*" >&2
 }
 
+# Verify a command both exists and actually runs (catches broken installs where
+# a shim is on PATH but the underlying package is missing or corrupt).
+claude_yolo_command_works() {
+    local cmd="$1"
+    shift
+
+    hash -r 2>/dev/null || true
+    command -v "$cmd" &>/dev/null || return 1
+    "$cmd" "$@" &>/dev/null
+}
+
+claude_yolo_claude_cli_works() {
+    claude_yolo_command_works claude --version
+}
+
 check_prereqs() {
     local missing=0
     if ! command -v tmux &>/dev/null; then
@@ -31,6 +46,9 @@ check_prereqs() {
     fi
     if ! command -v claude &>/dev/null; then
         log_error "claude (Claude Code CLI) is not installed"
+        missing=1
+    elif ! claude_yolo_claude_cli_works; then
+        log_error "claude (Claude Code CLI) is installed but cannot run; 'claude --version' failed. Re-install Claude Code (npm i -g @anthropic-ai/claude-code) or check your Node.js install."
         missing=1
     fi
     return $missing

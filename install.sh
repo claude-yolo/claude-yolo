@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh — Install claude-yolo from source
-# Usage: curl -fsSL https://<url>/install.sh | bash && export PATH="$HOME/.local/bin:$PATH"
+# Usage: curl -fsSL https://<url>/install.sh | bash && export PATH="${CLAUDE_YOLO_BIN_DIR:-$HOME/.local/bin}:${CLAUDE_YOLO_HOME:-$HOME/.claude-yolo}/bin:$PATH"
 #        ./install.sh --local   # install from the current local repo
 set -euo pipefail
 
@@ -14,7 +14,15 @@ done
 
 REPO="https://github.com/claude-yolo/claude-yolo.git"
 INSTALL_DIR="${CLAUDE_YOLO_HOME:-$HOME/.claude-yolo}"
-BIN_DIR="$HOME/.local/bin"
+DEFAULT_BIN_DIR="$HOME/.local/bin"
+REQUESTED_BIN_DIR="${CLAUDE_YOLO_BIN_DIR:-$DEFAULT_BIN_DIR}"
+BIN_DIR="$REQUESTED_BIN_DIR"
+NPM_PREFIX="${CLAUDE_YOLO_NPM_PREFIX:-$HOME/.local}"
+NPM_BIN_DIR="$NPM_PREFIX/bin"
+ORIGINAL_PATH="${PATH:-}"
+
+# Make user-prefix npm installs visible during this script, not just after it.
+export PATH="$BIN_DIR:$NPM_BIN_DIR:$ORIGINAL_PATH"
 
 # Colors (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -33,15 +41,108 @@ if [[ -n "${TERMUX_VERSION:-}" ]] || [[ -d /data/data/com.termux ]]; then
     IS_TERMUX=1
 fi
 
-# Use sudo only if not already root and sudo is available
+# Use sudo only if it is actually usable. Some locked-down systems have sudo
+# installed even though the current user is not allowed to run it.
 SUDO=""
-if [[ "$IS_TERMUX" -eq 0 ]] && [[ "$(id -u)" -ne 0 ]]; then
-    if command -v sudo &>/dev/null; then
-        SUDO="sudo"
-    else
-        warn "Not running as root and sudo is not available — package installs may fail"
-    fi
+CAN_INSTALL_SYSTEM_PACKAGES=0
+if [[ "$IS_TERMUX" -eq 1 ]]; then
+    :
+elif [[ "$(id -u)" -eq 0 ]]; then
+    CAN_INSTALL_SYSTEM_PACKAGES=1
+elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+    SUDO="sudo"
+    CAN_INSTALL_SYSTEM_PACKAGES=1
+else
+    warn "sudo is not available or not allowed — using user-space installs only"
 fi
+
+require_system_pkg_install() {
+    local pkg="$1"
+    if [[ "$CAN_INSTALL_SYSTEM_PACKAGES" -ne 1 ]]; then
+        error "$pkg is required, but this user cannot install system packages without sudo. Install $pkg manually and re-run."
+    fi
+}
+
+run_as_root() {
+    if [[ -n "$SUDO" ]]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
+run_noninteractive_as_root() {
+    if [[ -n "$SUDO" ]]; then
+        sudo env DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC "$@"
+    else
+        DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC "$@"
+    fi
+}
+
+run_apt_get() {
+    run_noninteractive_as_root apt-get "$@"
+}
+
+choose_bin_dir() {
+    local requested="$1"
+    local fallback="$INSTALL_DIR/bin"
+
+    if mkdir -p "$requested" 2>/dev/null && [[ -w "$requested" ]]; then
+        printf '%s\n' "$requested"
+        return 0
+    fi
+
+    if [[ -n "${CLAUDE_YOLO_BIN_DIR:-}" ]]; then
+        error "Cannot create or write CLAUDE_YOLO_BIN_DIR=$requested. Set CLAUDE_YOLO_BIN_DIR to a writable directory and re-run."
+    fi
+
+    warn "Cannot create or write $requested — falling back to $fallback" >&2
+    mkdir -p "$fallback" || error "Cannot create fallback bin directory: $fallback"
+    [[ -w "$fallback" ]] || error "Fallback bin directory is not writable: $fallback"
+    printf '%s\n' "$fallback"
+}
+
+git_install_dir() {
+    git -c "safe.directory=$INSTALL_DIR" -C "$INSTALL_DIR" "$@"
+}
+
+# Verify a command both exists and actually runs (catches broken installs where
+# a shim is on PATH but the underlying package is missing or corrupt).
+command_runnable() {
+    local cmd="$1"
+    shift
+
+    hash -r 2>/dev/null || true
+    command -v "$cmd" &>/dev/null || return 1
+    "$cmd" "$@" &>/dev/null
+}
+
+node_runtime_works() { command_runnable node --version; }
+npm_runtime_works()  { command_runnable npm --version; }
+claude_cli_works()   { command_runnable claude --version; }
+
+claude_cli_needs_install() {
+    command -v claude &>/dev/null || return 0
+    ! claude_cli_works
+}
+
+claude_cli_failure_summary() {
+    local path output
+    path="$(command -v claude 2>/dev/null || true)"
+    if [[ -z "$path" ]]; then
+        printf '%s\n' "claude was not found on PATH"
+        return 0
+    fi
+
+    if output="$(claude --version 2>&1)"; then
+        printf '%s\n' "claude works: $output"
+        return 0
+    fi
+
+    output="${output//$'\n'/; }"
+    [[ -n "$output" ]] || output="failed with no output"
+    printf '%s\n' "claude path: $path; claude --version: $output"
+}
 
 # Install a package using the appropriate package manager
 # Usage: install_pkg <package_name>
@@ -58,15 +159,20 @@ install_pkg() {
         if [[ "$IS_TERMUX" -eq 1 ]]; then
             pkg install -y "$pkg"
         elif command -v apt-get &>/dev/null; then
-            $SUDO apt-get update && $SUDO apt-get install -y "$pkg"
+            require_system_pkg_install "$pkg"
+            run_apt_get update && run_apt_get install -y "$pkg"
         elif command -v dnf &>/dev/null; then
-            $SUDO dnf install -y "$pkg"
+            require_system_pkg_install "$pkg"
+            run_as_root dnf install -y "$pkg"
         elif command -v yum &>/dev/null; then
-            $SUDO yum install -y "$pkg"
+            require_system_pkg_install "$pkg"
+            run_as_root yum install -y "$pkg"
         elif command -v pacman &>/dev/null; then
-            $SUDO pacman -S --noconfirm "$pkg"
+            require_system_pkg_install "$pkg"
+            run_as_root pacman -S --noconfirm "$pkg"
         elif command -v apk &>/dev/null; then
-            $SUDO apk add "$pkg"
+            require_system_pkg_install "$pkg"
+            run_as_root apk add "$pkg"
         else
             error "$pkg is required but no supported package manager found. Install $pkg manually."
         fi
@@ -129,8 +235,8 @@ fi
 # -------------------------------------------------------------------
 # Install Claude Code CLI if missing
 # -------------------------------------------------------------------
-if ! command -v claude &>/dev/null; then
-    info "Claude Code CLI is not installed — installing"
+if claude_cli_needs_install; then
+    info "Claude Code CLI is not installed (or not runnable) — installing"
     CLAUDE_INSTALLED=0
     if [[ "$IS_TERMUX" -eq 1 ]]; then
         # Termux: the official installer downloads a native binary that fails
@@ -164,42 +270,71 @@ if ! command -v claude &>/dev/null; then
             done
         fi
         # Fall back to npm if the binary installer failed (e.g., unsupported arch)
-        if ! command -v claude &>/dev/null && [[ "$CLAUDE_INSTALLED" -eq 0 ]]; then
+        if ! claude_cli_works && [[ "$CLAUDE_INSTALLED" -eq 0 ]]; then
             warn "Binary installer failed — falling back to npm install"
-            _ensure_npm() {
-                if command -v npm &>/dev/null; then return 0; fi
-                info "npm is not installed — attempting to install Node.js"
-                install_pkg nodejs
-                # Some distros package npm separately
-                command -v npm &>/dev/null || install_pkg npm
-            }
-            _ensure_npm
-            if command -v npm &>/dev/null; then
-                npm install -g @anthropic-ai/claude-code 2>/dev/null && CLAUDE_INSTALLED=1
-            fi
-            # If distro Node.js failed (common on aarch64 with 64KB pages),
-            # try NodeSource v22 with proper Node.js instead of Bun
-            if [[ "$CLAUDE_INSTALLED" -eq 0 ]] && command -v apt-get &>/dev/null; then
-                warn "npm install failed — trying with Node.js 22 via NodeSource"
-                # Remove conflicting distro Node.js packages before installing NodeSource
-                $SUDO apt-get remove -y nodejs libnode-dev libnode72 2>/dev/null || true
-                $SUDO apt-get autoremove -y 2>/dev/null || true
+
+            # Install Node.js 22 from NodeSource (proper Node.js, not Bun).
+            # Common need on aarch64 with 64KB pages where distro Node fails.
+            _install_nodesource_nodejs() {
+                command -v apt-get &>/dev/null || return 1
+                [[ "$CAN_INSTALL_SYSTEM_PACKAGES" -eq 1 ]] || return 1
+                command -v curl &>/dev/null || return 1
+
+                warn "Trying Node.js 22 via NodeSource"
+                run_apt_get remove -y nodejs libnode-dev libnode72 2>/dev/null || true
+                run_apt_get autoremove -y 2>/dev/null || true
                 if curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh 2>/dev/null; then
-                    $SUDO bash /tmp/nodesource_setup.sh 2>/dev/null
+                    run_noninteractive_as_root bash /tmp/nodesource_setup.sh 2>/dev/null
                     # Use --force-overwrite in case distro libnode-dev wasn't fully removed
-                    $SUDO apt-get install -y -o Dpkg::Options::="--force-overwrite" nodejs 2>/dev/null
+                    run_apt_get install -y -o Dpkg::Options::="--force-overwrite" nodejs 2>/dev/null
                     rm -f /tmp/nodesource_setup.sh
                 fi
-                if command -v npm &>/dev/null; then
-                    npm install -g @anthropic-ai/claude-code && CLAUDE_INSTALLED=1
+                node_runtime_works && npm_runtime_works
+            }
+
+            _ensure_npm() {
+                if node_runtime_works && npm_runtime_works; then return 0; fi
+                info "Node.js/npm not runnable — attempting to install Node.js"
+                if [[ "$IS_TERMUX" -eq 1 ]]; then
+                    pkg install -y nodejs
+                elif command -v apt-get &>/dev/null; then
+                    _install_nodesource_nodejs || {
+                        node_runtime_works || install_pkg nodejs
+                        npm_runtime_works  || install_pkg npm
+                    }
                 else
-                    warn "npm is not available — cannot install Claude Code CLI"
+                    node_runtime_works || install_pkg nodejs
+                    npm_runtime_works  || install_pkg npm
                 fi
+                node_runtime_works && npm_runtime_works
+            }
+
+            # Install the npm package into the global prefix, retrying under
+            # $NPM_PREFIX when an unprefixed global install is not permitted.
+            _npm_global_install() {
+                local pkg="$1"
+                if npm install -g "$pkg" 2>/dev/null; then
+                    hash -r 2>/dev/null || true
+                    return 0
+                fi
+                mkdir -p "$NPM_PREFIX"
+                if npm install -g --prefix "$NPM_PREFIX" "$pkg" 2>/dev/null; then
+                    hash -r 2>/dev/null || true
+                    return 0
+                fi
+                return 1
+            }
+
+            if _ensure_npm; then
+                _npm_global_install @anthropic-ai/claude-code && CLAUDE_INSTALLED=1
+            else
+                warn "npm is not available — cannot install Claude Code CLI"
             fi
         fi
     fi
-    if ! command -v claude &>/dev/null; then
+    if ! claude_cli_works; then
         ARCH="$(uname -m)"
+        warn "$(claude_cli_failure_summary)"
         error "Claude Code CLI could not be installed (platform: $OS, arch: $ARCH). Install it manually: https://docs.anthropic.com/en/docs/claude-code/getting-started"
     fi
 fi
@@ -220,8 +355,25 @@ if [[ "$LOCAL_INSTALL" -eq 1 ]]; then
     fi
 elif [[ -d "$INSTALL_DIR/.git" ]]; then
     info "Updating existing installation in $INSTALL_DIR"
-    git -C "$INSTALL_DIR" fetch origin 2>/dev/null
-    git -C "$INSTALL_DIR" reset --hard origin/main 2>/dev/null || error "Failed to update. Resolve manually in $INSTALL_DIR"
+    UPDATE_OK=1
+    UPDATE_OUTPUT=""
+    if ! UPDATE_OUTPUT="$(git_install_dir fetch origin 2>&1)"; then
+        UPDATE_OK=0
+        warn "Could not fetch the latest claude-yolo update:"
+        printf '%s\n' "$UPDATE_OUTPUT" >&2
+    elif ! UPDATE_OUTPUT="$(git_install_dir reset --hard origin/main 2>&1)"; then
+        UPDATE_OK=0
+        warn "Could not reset the existing claude-yolo checkout to origin/main:"
+        printf '%s\n' "$UPDATE_OUTPUT" >&2
+    fi
+
+    if [[ "$UPDATE_OK" -ne 1 ]]; then
+        if [[ -f "$INSTALL_DIR/claude-yolo" ]]; then
+            warn "Using existing installation in $INSTALL_DIR"
+        else
+            error "Existing installation is incomplete and could not be updated. Remove $INSTALL_DIR and re-run."
+        fi
+    fi
 else
     if [[ -d "$INSTALL_DIR" ]]; then
         error "$INSTALL_DIR already exists but is not a git repo. Remove it first and re-run."
@@ -235,7 +387,8 @@ chmod +x "$INSTALL_DIR/claude-yolo"
 # -------------------------------------------------------------------
 # Symlink into PATH
 # -------------------------------------------------------------------
-mkdir -p "$BIN_DIR"
+BIN_DIR="$(choose_bin_dir "$REQUESTED_BIN_DIR")"
+export PATH="$BIN_DIR:$NPM_BIN_DIR:$ORIGINAL_PATH"
 
 ln -sf "$INSTALL_DIR/claude-yolo" "$BIN_DIR/claude-yolo"
 info "Linked claude-yolo → $BIN_DIR/claude-yolo"
@@ -266,13 +419,21 @@ case "$SHELL_NAME" in
     *)    RC_FILE="$HOME/.profile" ;;
 esac
 
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
-    EXPORT_LINE='export PATH="$HOME/.local/bin:$PATH"'
+if ! echo "$ORIGINAL_PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
+    if [[ "$BIN_DIR" == "$DEFAULT_BIN_DIR" ]]; then
+        EXPORT_LINE='export PATH="$HOME/.local/bin:$PATH"'
+    else
+        EXPORT_LINE="export PATH=\"$BIN_DIR:\$PATH\""
+    fi
     if [[ "$SHELL_NAME" == "fish" ]]; then
-        EXPORT_LINE='fish_add_path $HOME/.local/bin'
+        if [[ "$BIN_DIR" == "$DEFAULT_BIN_DIR" ]]; then
+            EXPORT_LINE='fish_add_path $HOME/.local/bin'
+        else
+            EXPORT_LINE="fish_add_path $BIN_DIR"
+        fi
     fi
 
-    if [[ -f "$RC_FILE" ]] && grep -qF '.local/bin' "$RC_FILE" 2>/dev/null; then
+    if [[ -f "$RC_FILE" ]] && grep -qF "$BIN_DIR" "$RC_FILE" 2>/dev/null; then
         info "PATH entry already exists in $RC_FILE"
     else
         touch "$RC_FILE"

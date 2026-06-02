@@ -29,6 +29,8 @@ CONTROL_MULTILINE_PASTE_DELAY="${CLAUDE_YOLO_CONTROL_MULTILINE_PASTE_DELAY:-0.8}
 CONTROL_QUEUE_WAIT_DELAY="${CLAUDE_YOLO_CONTROL_QUEUE_WAIT_DELAY:-1}"
 CONTROL_QUEUE_POST_SEND_GRACE="${CLAUDE_YOLO_CONTROL_QUEUE_POST_SEND_GRACE:-0.5}"
 CONTROL_QUEUE_LOCK_DELAY="${CLAUDE_YOLO_CONTROL_QUEUE_LOCK_DELAY:-0.05}"
+CONTROL_INJECT_ATTEMPTS="${CLAUDE_YOLO_CONTROL_INJECT_ATTEMPTS:-100}"
+CONTROL_INJECT_DELAY="${CLAUDE_YOLO_CONTROL_INJECT_DELAY:-0.1}"
 CONTROL_QUEUE_PARSED_ITEMS=()
 
 control_audit() {
@@ -53,6 +55,15 @@ control_trim() {
     local value="$1"
     value="$(control_ltrim "$value")"
     control_rtrim "$value"
+}
+
+# Normalize CRLF / lone CR line endings to LF so pasted or piped multi-line
+# input (Windows clipboards, CRLF heredocs) parses and sends correctly.
+control_normalize_line_endings() {
+    local value="$1"
+    value="${value//$'\r\n'/$'\n'}"
+    value="${value//$'\r'/$'\n'}"
+    printf '%s' "$value"
 }
 
 control_preview() {
@@ -124,6 +135,7 @@ control_parse_queue_items() {
     local text="$1" pos=0 len="${#1}" ch item
 
     CONTROL_QUEUE_PARSED_ITEMS=()
+    text="$(control_normalize_line_endings "$text")"
     text="$(control_trim "$text")"
     len="${#text}"
     (( len > 0 )) || return 1
@@ -244,10 +256,12 @@ control_collect_queue_array_payload() {
     local payload="$1" line
 
     payload="$(control_collect_queue_payload "$payload")"
+    payload="$(control_normalize_line_endings "$payload")"
     while control_queue_array_needs_more "$payload"; do
         if ! control_read_continuation_line line "claude-yolo queue> "; then
             break
         fi
+        line="$(control_normalize_line_endings "$line")"
         payload+=$'\n'"$line"
     done
 
@@ -331,6 +345,7 @@ control_collect_plan_prompt() {
     fi
 
     if [[ -n "$chunk" ]]; then
+        chunk="$(control_normalize_line_endings "$chunk")"
         # The submit newline for a pasted command is a delimiter, not prompt text.
         [[ "$chunk" == *$'\n' ]] && chunk="${chunk%$'\n'}"
         if [[ -n "$prompt" ]]; then
@@ -369,6 +384,7 @@ control_read_line() {
         fi
     fi
 
+    __line_value="$(control_normalize_line_endings "$__line_value")"
     printf -v "$__line_var" '%s' "$__line_value"
 }
 
@@ -391,6 +407,7 @@ control_send_text_to_target() {
     local target="$1" text="$2"
     local buffer
 
+    text="$(control_normalize_line_endings "$text")"
     if [[ "$text" != *$'\n'* ]]; then
         tmux send-keys -t "$target" -l "$text" 2>/dev/null
         return
@@ -1619,6 +1636,55 @@ control_main() {
     control_audit "control pane stopped"
 }
 
+# Inject a single slash command into a session's control pane, once it is ready.
+# Used by `claude-yolo -c/--command` to drive /loop, /queue, /plan, etc. at launch
+# or on --resume, exactly as if typed at the claude-yolo> prompt.
+control_inject_command_once() {
+    local session="$1" audit_log="$2" command="$3"
+    local target="${session}:control"
+    local attempt content="" preview
+
+    if [[ -z "$command" ]]; then
+        AUDIT_LOG="$audit_log" control_audit "INJECT skipped: empty command"
+        return 1
+    fi
+
+    for (( attempt=1; attempt<=CONTROL_INJECT_ATTEMPTS; attempt++ )); do
+        if ! tmux has-session -t "$session" 2>/dev/null; then
+            AUDIT_LOG="$audit_log" control_audit "INJECT aborted: session gone ($session)"
+            return 1
+        fi
+        content="$(control_capture_target "$target" 2>/dev/null)" || content=""
+        [[ "$content" == *"claude-yolo control ready"* ]] && break
+        sleep "$CONTROL_INJECT_DELAY" 2>/dev/null || true
+    done
+
+    if [[ "$content" != *"claude-yolo control ready"* ]]; then
+        AUDIT_LOG="$audit_log" control_audit "INJECT timeout waiting for control pane: $target"
+        return 1
+    fi
+
+    preview="${command:0:80}"
+    (( ${#command} > 80 )) && preview+="..."
+    AUDIT_LOG="$audit_log" control_audit "INJECT one-shot: $preview"
+
+    if ! control_send_text_to_target "$target" "$command"; then
+        AUDIT_LOG="$audit_log" control_audit "INJECT send-keys failed: $target"
+        return 1
+    fi
+    control_delay_after_text_send "$command"
+    if ! tmux send-keys -t "$target" Enter 2>/dev/null; then
+        AUDIT_LOG="$audit_log" control_audit "INJECT Enter failed: $target"
+        return 1
+    fi
+
+    return 0
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [[ "$SESSION_MODE" == "inject-once" ]]; then
+        control_inject_command_once "$SESSION_NAME" "$AUDIT_LOG" "${4:-}"
+        exit $?
+    fi
     control_main "$@"
 fi

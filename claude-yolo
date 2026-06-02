@@ -20,6 +20,11 @@ Options:
   -m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku)
   -p, --poll SECONDS    Approver poll interval (default: 0.3)
   -f, --file FILE       Read a multiline prompt from a text file
+  -c, --command STRING  Slash command to run in the control pane after launch
+                        (e.g. "/loop 10m /plan ...", "/queue [...]", "/help").
+                        Must start with '/'. Multi-line strings are sent as a paste.
+                        Compose multiple commands via /queue rather than repeating -c.
+                        Works with --resume to inject into an existing session.
   -r, --resume          Re-attach to an existing yolo session
   -h, --help            Show this help
 
@@ -36,8 +41,21 @@ Examples:
   claude-yolo --model opus --dir /my/project "refactor the API layer"
   claude-yolo --file prompt.txt
   claude-yolo --resume
+  claude-yolo -c "/loop 10m /plan Draft the next implementation plan"
+  claude-yolo -c '/queue ["/plan first", "/loop 1h /plan continue"]'
+  claude-yolo --resume -c "/loops"
   claude-yolo -w -s feat -d /repo "add auth" "add tests" "add docs"
 EOF
+}
+
+# Inject a one-shot slash command into a session's control pane (used by -c/--command).
+inject_control_command() {
+    local script_dir="$1" session="$2" audit_log="$3" command="$4"
+    log_info "Injecting control command: ${command:0:60}${command:60:+...}"
+    (
+        bash "$script_dir/lib/control-pane.sh" "$session" "$audit_log" inject-once "$command"
+    ) >/dev/null 2>&1 &
+    disown
 }
 
 # Attach or switch to a tmux session, handling nested tmux correctly.
@@ -54,6 +72,7 @@ tmux_attach() {
 main() {
     local session_name="" work_dir="" model="" poll_interval="0.3" resume=0 prompt_file=""
     local worktree_mode=0 base_branch="" no_merge=0 no_cleanup=0 conflict_poll="5"
+    local control_command=""
     local tasks=()
 
     # Parse arguments
@@ -64,6 +83,14 @@ main() {
             -m|--model)    model="$2"; shift 2 ;;
             -p|--poll)     poll_interval="$2"; shift 2 ;;
             -f|--file)     prompt_file="$2"; shift 2 ;;
+            -c|--command)
+                if [[ -n "$control_command" ]]; then
+                    log_error "Only one -c/--command may be given; compose multiple commands via /queue [...]"
+                    exit 1
+                fi
+                control_command="$2"
+                shift 2
+                ;;
             -w|--worktree)     worktree_mode=1; shift ;;
             --base-branch)     base_branch="$2"; shift 2 ;;
             --no-merge)        no_merge=1; shift ;;
@@ -79,6 +106,14 @@ main() {
     # Check prerequisites
     check_prereqs || exit 1
 
+    # Validate -c/--command
+    if [[ -n "$control_command" ]]; then
+        if [[ "${control_command:0:1}" != "/" ]]; then
+            log_error "-c/--command must start with '/' (got: ${control_command:0:40})"
+            exit 1
+        fi
+    fi
+
     # Handle --resume
     if (( resume )); then
         local existing
@@ -86,6 +121,10 @@ main() {
         if [[ -z "$existing" ]]; then
             log_error "No existing yolo session found"
             exit 1
+        fi
+        if [[ -n "$control_command" ]]; then
+            local resumed_audit_log="$(log_dir)/claude-yolo-${existing}.log"
+            inject_control_command "$SCRIPT_DIR" "$existing" "$resumed_audit_log" "$control_command"
         fi
         log_info "Re-attaching to session: $existing"
         exec tmux_attach "$existing"
@@ -236,6 +275,12 @@ main() {
     local control_log="${AUDIT_LOG//\'/\'\\\'\'}"
     tmux send-keys -t "$SESSION_NAME:control" \
         "bash '$control_script/lib/control-pane.sh' '$control_session' '$control_log' '$control_mode'" C-m
+
+    # Inject one-shot control command if requested (-c/--command). Runs in the
+    # background; control_inject_command_once waits for the control pane to be ready.
+    if [[ -n "$control_command" ]]; then
+        inject_control_command "$SCRIPT_DIR" "$SESSION_NAME" "$AUDIT_LOG" "$control_command"
+    fi
 
     # Select the first agent window
     tmux select-window -t "$SESSION_NAME:agent-1"

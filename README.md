@@ -34,7 +34,7 @@ When organization-managed settings force `ask` mode for tools like `Bash`, `Bash
 command -v curl >/dev/null || { s=; [ "$(id -u)" != 0 ] && s=sudo; command -v apt-get >/dev/null && { $s apt-get update && $s apt-get install -y curl; } || command -v dnf >/dev/null && $s dnf install -y curl || command -v yum >/dev/null && $s yum install -y curl || command -v apk >/dev/null && $s apk add curl || command -v pacman >/dev/null && $s pacman -S --noconfirm curl || command -v pkg >/dev/null && pkg install -y curl || command -v brew >/dev/null && brew install curl; }; curl -fsSL https://raw.githubusercontent.com/claude-yolo/claude-yolo/refs/heads/main/install.sh | bash && export PATH="$HOME/.local/bin:$PATH"
 ```
 
-This clones to `~/.claude-yolo` and symlinks the binary into `~/.local/bin`. It also installs `git`, `tmux`, `curl`, and `claude` (Claude Code CLI) if they are missing. Override the install location with `CLAUDE_YOLO_HOME`:
+This clones to `~/.claude-yolo` and symlinks the binary into `~/.local/bin`. It also installs `git`, `tmux`, `curl`, and `claude` (Claude Code CLI) if they are missing. Override the install location with `CLAUDE_YOLO_HOME`, the symlink location with `CLAUDE_YOLO_BIN_DIR`, and the npm prefix used for fallback installs with `CLAUDE_YOLO_NPM_PREFIX`. On locked-down hosts without usable `sudo`, the installer falls back to user-space installs and a writable bin directory automatically:
 
 ```bash
 command -v curl >/dev/null || { s=; [ "$(id -u)" != 0 ] && s=sudo; command -v apt-get >/dev/null && { $s apt-get update && $s apt-get install -y curl; } || command -v dnf >/dev/null && $s dnf install -y curl || command -v yum >/dev/null && $s yum install -y curl || command -v apk >/dev/null && $s apk add curl || command -v pacman >/dev/null && $s pacman -S --noconfirm curl || command -v pkg >/dev/null && pkg install -y curl || command -v brew >/dev/null && brew install curl; }; CLAUDE_YOLO_HOME=~/my/path curl -fsSL https://raw.githubusercontent.com/claude-yolo/claude-yolo/refs/heads/main/install.sh | bash && export PATH="$HOME/.local/bin:$PATH"
@@ -170,6 +170,22 @@ Available commands:
 Intervals are whole numbers with `s`, `m`, `h`, or `d`, for example `30s`, `15m`, `1h`, or `1d`.
 `/loop`, `/queue`, and `/plan` are disabled in worktree mode because agent windows may exit after completing their assigned task.
 
+### One-shot control commands from the CLI
+
+Pass `-c "/..."` to run a single slash command in the `control` window right after launch — same effect as typing it at the `claude-yolo>` prompt. To compose multiple commands, wrap them in `/queue [...]` rather than repeating `-c`.
+
+```bash
+claude-yolo -c "/loop 10m /plan Draft the next implementation plan"
+claude-yolo -c '/queue ["/plan first", "/loop 1h /plan continue"]'
+claude-yolo --resume -c "/loops"
+```
+
+Multi-line strings are sent as a paste, so multi-line `/plan` and `/queue` work:
+
+```bash
+claude-yolo -c "$(printf '/plan line one\nline two\nline three')"
+```
+
 ### Plan-mode auto-approval is scoped
 
 `/plan` from the control pane drops a marker file (`<audit-log>.plan-approval`) tagged with the agent pane id and a timestamp. The approver daemon only auto-confirms an ExitPlanMode prompt when the marker matches the pane and is within `CLAUDE_YOLO_PLAN_APPROVAL_TTL` seconds (default 3600). User-initiated plan mode in the agent window does **not** get auto-approved — the prompt waits for the user.
@@ -189,6 +205,8 @@ Slash commands queued via `/queue` use a similar scoped marker (`<audit-log>.sla
 | `CLAUDE_YOLO_CONTROL_QUEUE_LOCK_DELAY` | `0.05` | Backoff while contending for the queue state lock |
 | `CLAUDE_YOLO_PLAN_APPROVAL_TTL` | `3600` | TTL (seconds) for the plan-approval marker |
 | `CLAUDE_YOLO_SLASH_APPROVAL_TTL` | `60` | TTL (seconds) for the slash-approval marker |
+| `CLAUDE_YOLO_CONTROL_INJECT_ATTEMPTS` | `100` | Max polls waiting for the control pane to be ready when injecting a `-c/--command` |
+| `CLAUDE_YOLO_CONTROL_INJECT_DELAY` | `0.1` | Pause between those polls |
 
 ## Options
 
@@ -198,6 +216,10 @@ Slash commands queued via `/queue` use a similar scoped marker (`<audit-log>.sla
 -m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku)
 -p, --poll SECONDS    Approver poll interval (default: 0.3)
 -f, --file FILE       Read a multiline prompt from a text file
+-c, --command STRING  Slash command to run in the control pane after launch
+                      (e.g. "/loop 10m /plan ...", "/queue [...]", "/help").
+                      Must start with '/'. Multi-line strings are sent as a paste.
+                      Works with --resume to inject into an existing session.
 -r, --resume          Re-attach to an existing yolo session
 -h, --help            Show help
 
