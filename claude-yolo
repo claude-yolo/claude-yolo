@@ -167,6 +167,10 @@ main() {
     # Auto-trust the working directory so Claude Code skips the "trust this folder" prompt
     ensure_trusted "$work_dir"
 
+    # Ring the terminal bell on task completion / input requests (only if the user
+    # has not already configured a notification preference)
+    ensure_bell
+
     # ── worktree setup ───────────────────────────────────────────────────────
     if (( worktree_mode )); then
         source "$SCRIPT_DIR/lib/worktree-manager.sh"

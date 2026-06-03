@@ -1556,6 +1556,118 @@ assert_ok "ensure_trusted: creates .claude.json if missing" _test_trust_creates_
 assert_ok "ensure_trusted: skips if already trusted" _test_trust_already_trusted
 
 ###############################################################################
+
+section "ensure_bell — Auto-configure terminal bell notifications"
+
+# Test: creates settings.json with both bell mechanisms if it doesn't exist
+_test_bell_creates_settings() {
+    local fake_home
+    fake_home="$(mktemp -d)"
+    HOME="$fake_home" ensure_bell 2>/dev/null
+
+    local result=""
+    [[ -f "$fake_home/.claude/settings.json" ]] && \
+        result="$(cat "$fake_home/.claude/settings.json")"
+    rm -rf "$fake_home"
+
+    [[ "$result" == *'"preferredNotifChannel": "terminal_bell"'* ]] && \
+    [[ "$result" == *'"Stop"'* ]] && \
+    [[ "$result" == *'printf'* ]]
+}
+
+# Test: adds bell config to an empty/minimal settings object
+_test_bell_adds_to_existing() {
+    local fake_home
+    fake_home="$(mktemp -d)"
+    mkdir -p "$fake_home/.claude"
+    cat > "$fake_home/.claude/settings.json" <<'EOF'
+{
+  "model": "opus"
+}
+EOF
+    HOME="$fake_home" ensure_bell 2>/dev/null
+
+    local result
+    result="$(cat "$fake_home/.claude/settings.json")"
+    rm -rf "$fake_home"
+
+    # New bell settings added, existing settings preserved
+    [[ "$result" == *'"preferredNotifChannel": "terminal_bell"'* ]] && \
+    [[ "$result" == *'"Stop"'* ]] && \
+    [[ "$result" == *'"model"'* ]]
+}
+
+# Test: idempotent — running twice doesn't duplicate the channel
+_test_bell_idempotent() {
+    local fake_home
+    fake_home="$(mktemp -d)"
+    HOME="$fake_home" ensure_bell 2>/dev/null
+    HOME="$fake_home" ensure_bell 2>/dev/null
+
+    local count
+    count="$(grep -c 'preferredNotifChannel' "$fake_home/.claude/settings.json")"
+    rm -rf "$fake_home"
+
+    [[ "$count" -eq 1 ]]
+}
+
+# Test: respects an explicit prior channel choice (does not override)
+_test_bell_respects_existing_channel() {
+    local fake_home
+    fake_home="$(mktemp -d)"
+    mkdir -p "$fake_home/.claude"
+    cat > "$fake_home/.claude/settings.json" <<'EOF'
+{
+  "preferredNotifChannel": "notifications_disabled"
+}
+EOF
+    HOME="$fake_home" ensure_bell 2>/dev/null
+
+    local result
+    result="$(cat "$fake_home/.claude/settings.json")"
+    rm -rf "$fake_home"
+
+    # User silenced notifications — leave it fully alone (no bell forced in)
+    [[ "$result" == *'notifications_disabled'* ]] && \
+    [[ "$result" != *'terminal_bell'* ]] && \
+    [[ "$result" != *'"Stop"'* ]]
+}
+
+# Test: does not touch settings that already have a Stop hook (bell considered
+# "previously configured")
+_test_bell_respects_existing_stop_hook() {
+    local fake_home
+    fake_home="$(mktemp -d)"
+    mkdir -p "$fake_home/.claude"
+    cat > "$fake_home/.claude/settings.json" <<'EOF'
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "my-custom-stop-hook" } ] }
+    ]
+  }
+}
+EOF
+    HOME="$fake_home" ensure_bell 2>/dev/null
+
+    local result count
+    result="$(cat "$fake_home/.claude/settings.json")"
+    count="$(grep -c '"Stop"' "$fake_home/.claude/settings.json")"
+    rm -rf "$fake_home"
+
+    # Existing Stop hook preserved, no second Stop added, channel NOT forced in
+    [[ "$result" == *'my-custom-stop-hook'* ]] && \
+    [[ "$count" -eq 1 ]] && \
+    [[ "$result" != *'terminal_bell'* ]]
+}
+
+assert_ok "ensure_bell: creates settings.json if missing" _test_bell_creates_settings
+assert_ok "ensure_bell: adds to existing settings, preserves them" _test_bell_adds_to_existing
+assert_ok "ensure_bell: idempotent (no duplicates)" _test_bell_idempotent
+assert_ok "ensure_bell: respects existing channel choice" _test_bell_respects_existing_channel
+assert_ok "ensure_bell: respects existing Stop hook" _test_bell_respects_existing_stop_hook
+
+###############################################################################
 #                         AUDIT FUNCTION                                      #
 ###############################################################################
 

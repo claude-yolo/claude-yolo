@@ -236,7 +236,7 @@ install.sh options:
 
 ## How it works
 
-1. **Launcher** (`claude-yolo`) creates a tmux session and spawns one window per task, each running `claude`.
+1. **Launcher** (`claude-yolo`) creates a tmux session and spawns one window per task, each running `claude`. At startup it also auto-trusts the working directory (so Claude Code skips the "trust this folder" prompt) and, **if you have not already set a notification preference**, configures `~/.claude/settings.json` to ring the terminal bell when a task finishes or your input is requested (`preferredNotifChannel: terminal_bell` plus a `Stop` hook). An existing channel choice or `Stop` hook is left untouched.
 2. **Control pane** (`lib/control-pane.sh`) opens the `control` window, tails the audit log, and handles slash commands such as `/loop`.
 3. **Approver daemon** (`lib/approver-daemon.sh`) runs in the background, polling every 0.3s. For each pane it:
    - Captures visible content via `tmux capture-pane`
