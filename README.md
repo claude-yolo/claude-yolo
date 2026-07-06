@@ -205,6 +205,7 @@ Slash commands queued via `/queue` use a similar scoped marker (`<audit-log>.sla
 | `CLAUDE_YOLO_CONTROL_QUEUE_LOCK_DELAY` | `0.05` | Backoff while contending for the queue state lock |
 | `CLAUDE_YOLO_PLAN_APPROVAL_TTL` | `3600` | TTL (seconds) for the plan-approval marker |
 | `CLAUDE_YOLO_SLASH_APPROVAL_TTL` | `60` | TTL (seconds) for the slash-approval marker |
+| `CLAUDE_YOLO_SEND_STREAK_CAP` | `5` | Max keys sent to a pane whose content never changes (static false-positive guard) |
 | `CLAUDE_YOLO_CONTROL_INJECT_ATTEMPTS` | `100` | Max polls waiting for the control pane to be ready when injecting a `-c/--command` |
 | `CLAUDE_YOLO_CONTROL_INJECT_DELAY` | `0.1` | Pause between those polls |
 
@@ -241,7 +242,8 @@ install.sh options:
 3. **Approver daemon** (`lib/approver-daemon.sh`) runs in the background, polling every 0.3s. For each pane it:
    - Captures visible content via `tmux capture-pane`
    - Detects three prompt styles (see below)
-   - Sends `Enter` via `tmux send-keys` to confirm the pre-selected option
+   - Sends `Enter` via `tmux send-keys` to confirm the Yes option when it is selected; if the `❯` marker sits on another option, sends the Yes option's number instead so the approval always lands on Yes
+   - Auto-answers `AskUserQuestion` dialogs that carry a `(Recommended)` option — Enter when the marker is already on it, the option's number otherwise. Questions without a recommended option are left for the user
    - If the transcript is collapsed (`● Bash(...)` visible but prompt hidden), sends `Ctrl+O` to expand it first — the next poll cycle then approves
    - Applies a 2-second per-pane cooldown to prevent double-approvals
 4. **Audit log** at `/tmp/claude-yolo-<session>.log` records every approval and control event with timestamps. Each session gets its own log, so concurrent claude-yolo processes don't interfere.
@@ -263,9 +265,13 @@ The approver requires the primary signal plus at least one secondary signal to f
 | Signal | Type | Patterns |
 |---|---|---|
 | Allow + Deny | Primary (either) | Both `Allow` and `Deny` in last 20 lines |
-| N. Yes / N. No | Primary (either) | Numbered options like `1. Yes` and `2. No` |
+| N. Yes / N. No | Primary (either) | Line-anchored numbered options like `❯ 1. Yes` (matched across the whole visible pane — a long command echoed in a `Yes, and don't ask again for: …` option can push `1. Yes` far above the last 20 lines) and `2. No` within the last 25 lines (a live dialog always renders its last option near the pane bottom, which keeps menus merely *displayed* higher up from firing) |
 | Tool keywords | Secondary (at least one) | `Bash`, `WebFetch`, `Read`, `Write`, `Edit`, `execute`, `run` |
-| Context phrases | Secondary (at least one) | `want to proceed`, `wants to execute`, `wants to run`, `permission`, `allow once`, `allow always` |
+| Context phrases | Secondary (at least one) | `want to proceed`, `wants to execute`, `wants to run`, `permission`, `allow once`, `allow always`, `requires approval`, `requires confirmation` |
+
+**Question dialogs** (`AskUserQuestion`) — auto-answered only when a numbered option is labelled `(Recommended)` (case-sensitive: Claude Code's own pickers like `/model` use lowercase `(recommended)` and are left alone), an active `❯`/`›` selection marker is visible (a bare `>` — blockquotes, PS2 lines — doesn't count), and an option line sits within the last 25 lines of the pane (live dialogs render near the bottom). multiSelect questions (checkbox options) are left for the user — blind Enter would submit nothing. The daemon presses Enter if the marker is already on the recommended option, or the option's number to jump to it (the next poll cycle confirms with Enter if needed). Questions without a recommended option wait for the user.
+
+**Safety rails** — a static-pane send cap stops keying a pane after 5 sends with byte-identical content (a "prompt" that doesn't react to keys is a false positive; the audit log records `suppressed-static` once), configurable via `CLAUDE_YOLO_SEND_STREAK_CAP`. A per-session `flock` on `<audit-log>.lock` refuses duplicate daemons for the same session, so keys are never double-sent during redeploys.
 
 **Collapsed view** — detected when the transcript is toggled off:
 
@@ -287,7 +293,7 @@ lib/
   worktree-manager.sh    # Git worktree lifecycle (create, list, cleanup)
   conflict-daemon.sh     # Real-time conflict detection via git merge-tree
   merge-resolver.sh      # Sequential merge + Claude-powered conflict resolution
-test_approver.sh         # Test suite (226 tests)
+test_approver.sh         # Test suite (304 tests)
 docs/
   worktree-mode-demo.md  # Step-by-step demo with Ubuntu 24.04 container
 ```
@@ -315,6 +321,8 @@ bash test_approver.sh Integration
 
 The test suite covers:
 - Prompt detection for Bash, Bash(rm:\*), and WebFetch permission patterns
+- Long `don't ask again` menus that scroll the Yes option out of the tail window
+- `AskUserQuestion` recommended-option detection and key targeting
 - False positive resistance (code output, markdown, missing signals)
 - Cooldown logic, command construction, audit logging
 - End-to-end integration tests using real tmux sessions

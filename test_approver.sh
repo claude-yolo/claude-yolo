@@ -135,7 +135,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 # Source detect_prompt, detect_collapsed and friends without running the daemon's main_loop.
 # We extract the functions only.
-eval "$(sed -n '/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_plan_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p; /^plan_approval_file()/,/^}/p; /^slash_approval_file()/,/^}/p; /^clear_plan_approval_marker()/,/^}/p; /^clear_slash_approval_marker()/,/^}/p; /^plan_approval_marker_valid()/,/^}/p; /^slash_approval_marker_valid()/,/^}/p' "$SCRIPT_DIR/lib/approver-daemon.sh")"
+eval "$(sed -n '/^declare -A LAST_APPROVED/p; /^declare -A LAST_SENT_HASH/p; /^declare -A SEND_STREAK/p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^send_should_skip()/,/^}/p; /^note_key_sent()/,/^}/p; /^detect_prompt()/,/^}/p; /^prompt_approval_key()/,/^}/p; /^detect_question_prompt()/,/^}/p; /^question_approval_key()/,/^}/p; /^detect_plan_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p; /^plan_approval_file()/,/^}/p; /^slash_approval_file()/,/^}/p; /^clear_plan_approval_marker()/,/^}/p; /^clear_slash_approval_marker()/,/^}/p; /^plan_approval_marker_valid()/,/^}/p; /^slash_approval_marker_valid()/,/^}/p' "$SCRIPT_DIR/lib/approver-daemon.sh")"
 
 # Source build_agent_cmd from the launcher
 eval "$(sed -n '/^build_agent_cmd()/,/^}/p' "$SCRIPT_DIR/claude-yolo")"
@@ -384,6 +384,364 @@ _out="$(detect_prompt "$(cat <<'PANE'
 PANE
 )")"
 assert_contains "Trust folder: pattern includes +context" "$_out" "+context"
+
+###############################################################################
+#          YES/NO STYLE — LONG "DON'T ASK AGAIN" MENUS (WIDE WINDOW)          #
+###############################################################################
+
+section "detect_prompt — Yes/No style: long don't-ask-again menus"
+
+# Exact real capture: a multi-line command echoed inside option 2 pushes
+# "❯ 1. Yes" (and "Do you want to proceed?") above the 20-line tail window,
+# and a task list fills the bottom of the pane.
+_long_dontask_prompt="$(cat <<'PANE'
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for: timeout 120 docker exec
+      codex-telegram-bot-1 sh -c '
+      cd /tmp
+      for tier in fast priority unset; do
+        if [ "$tier" = unset ]; then arg=""; else arg="-c
+      service_tier=$tier"; fi
+        RUST_LOG=codex_core=trace,codex_api=trace codex exec
+      --skip-git-repo-check --color never -s read-only -m
+      gpt-5.6-sol -c model_reasoning_effort=low $arg -- "Reply OK"
+      >/dev/null 2>/tmp/trace-$tier.log
+        echo "== tier=$tier:"
+        grep -io "service_tier[\":= ]*[a-z_]*"
+      /tmp/trace-$tier.log | sort | uniq -c | head -5
+      done'
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+
+  5 tasks (0 done, 5 open)
+  ◻ Pin latest codex + codex-yolo in Dockerfile
+  ◻ Default model gpt-5.6-sol + ultra effort + fast ti…
+  ◻ Run tests and rebuild image
+  ◻ Update running containers (gateway + workers)
+  ◻ Commit and push to main
+PANE
+)"
+
+assert_ok "Long don't-ask-again: Yes option above tail window is detected" \
+    detect_prompt "$_long_dontask_prompt"
+
+_out="$(detect_prompt "$_long_dontask_prompt")"
+assert_contains "Long don't-ask-again: pattern includes +context" "$_out" "+context"
+
+assert_eq "Long don't-ask-again: marker on Yes → Enter" \
+    "Enter" "$(prompt_approval_key "$_long_dontask_prompt")"
+
+# Same shape but even the header scrolled off — context comes from
+# "requires approval" alone
+assert_ok "Long don't-ask-again: 'requires approval' as only context" \
+    detect_prompt "$(cat <<'PANE'
+ This command requires approval
+ ❯ 1. Yes
+   2. Yes, and don't ask again for: some-very-long-obscure-utility
+      --with --many --flags
+   3. No
+PANE
+)"
+
+# A stale menu-looking numbered list without any secondary signal must not fire
+assert_fail "Long don't-ask-again FP: menu shape without secondary signal" \
+    detect_prompt "$(cat <<'PANE'
+ ❯ 1. Yes
+   2. No
+ some unrelated pane content
+PANE
+)"
+
+# Numbered prose starting with Yes*/No* words must not count as menu options
+assert_fail "Long don't-ask-again FP: 'Yesterday/Nothing' prose list" \
+    detect_prompt "$(cat <<'PANE'
+ Status summary:
+ 1. Yesterday the daemon was running fine
+ 2. Nothing is blocking the release
+ I will start by running the existing suite.
+PANE
+)"
+
+# Quoted menu strings in code output must not count as option lines
+assert_fail "Long don't-ask-again FP: quoted Yes/No in code, wide window" \
+    detect_prompt "$(cat <<'PANE'
+  options = {
+    "1. Yes": handle_yes,
+    "2. No": handle_no,
+  }
+  print("Do you want to proceed?")
+  more output here
+PANE
+)"
+
+# A menu merely *displayed* high on screen (cat/diff of fixtures) with an idle
+# shell at the bottom must not fire: the No option is not near the pane bottom.
+assert_fail "Long don't-ask-again FP: displayed menu with 25+ lines below" \
+    detect_prompt "$(cat <<'PANE'
+$ sed -n '380,400p' test_approver.sh
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for: git push
+   3. No
+line6
+line7
+line8
+line9
+line10
+line11
+line12
+line13
+line14
+line15
+line16
+line17
+line18
+line19
+line20
+line21
+line22
+line23
+line24
+line25
+line26
+line27
+line28
+line29
+line30
+$
+PANE
+)"
+
+###############################################################################
+#                 PROMPT APPROVAL KEY — TARGETING THE YES OPTION              #
+###############################################################################
+
+section "prompt_approval_key — always lands on Yes"
+
+assert_eq "Approval key: marker on '1. Yes' → Enter" \
+    "Enter" "$(prompt_approval_key "$(cat <<'PANE'
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+PANE
+)")"
+
+assert_eq "Approval key: marker on 'Yes, and don't ask again' → Enter" \
+    "Enter" "$(prompt_approval_key "$(cat <<'PANE'
+ Do you want to proceed?
+   1. Yes
+ ❯ 2. Yes, and don't ask again for: git push
+   3. No
+PANE
+)")"
+
+assert_eq "Approval key: marker moved to No → send Yes option number" \
+    "1" "$(prompt_approval_key "$(cat <<'PANE'
+ Do you want to proceed?
+   1. Yes
+   2. Yes, and don't ask again for: git push
+ ❯ 3. No
+PANE
+)")"
+
+assert_eq "Approval key: trust folder marker on Yes → Enter" \
+    "Enter" "$(prompt_approval_key "$(cat <<'PANE'
+ Quick safety check: Is this a project you created or one you trust?
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+PANE
+)")"
+
+assert_eq "Approval key: Style A buttons (no marker) → Enter" \
+    "Enter" "$(prompt_approval_key "$(cat <<'PANE'
+  Claude wants to execute Bash
+  ls -la /tmp
+  Allow              Deny
+PANE
+)")"
+
+###############################################################################
+#            ASKUSERQUESTION DIALOGS — RECOMMENDED OPTION AUTO-ANSWER         #
+###############################################################################
+
+section "detect_question_prompt — AskUserQuestion recommended options"
+
+_question_marker_on_recommended="$(cat <<'PANE'
+ Which auth method should we use?
+
+ ❯ 1. JWT tokens (Recommended)
+      Stateless, no session store needed
+   2. Session cookies
+      Server-side session store
+   3. Other
+      Provide your own answer
+PANE
+)"
+
+_question_marker_elsewhere="$(cat <<'PANE'
+ Which auth method should we use?
+
+ ❯ 1. Session cookies
+      Server-side session store
+   2. JWT tokens (Recommended)
+      Stateless, no session store needed
+   3. Other
+      Provide your own answer
+PANE
+)"
+
+_question_marker_on_other="$(cat <<'PANE'
+ Which auth method should we use?
+
+   1. JWT tokens (Recommended)
+      Stateless, no session store needed
+   2. Session cookies
+      Server-side session store
+ ❯ 3. Other
+      Provide your own answer
+PANE
+)"
+
+assert_ok "Question: recommended option with marker detected" \
+    detect_question_prompt "$_question_marker_on_recommended"
+
+assert_ok "Question: recommended option, marker elsewhere, detected" \
+    detect_question_prompt "$_question_marker_on_other"
+
+_out="$(detect_question_prompt "$_question_marker_on_recommended")"
+assert_eq "Question: pattern is question+recommended" \
+    "question+recommended" "$_out"
+
+# Boxed rendering with │ borders
+assert_ok "Question: boxed rendering with borders detected" \
+    detect_question_prompt "$(cat <<'PANE'
+ ╭──────────────────────────────────────────────╮
+ │ Which library should we use?                 │
+ │                                              │
+ │ ❯ 1. requests (Recommended)                  │
+ │   2. httpx                                   │
+ │   3. Other                                   │
+ ╰──────────────────────────────────────────────╯
+PANE
+)"
+
+# No recommended label → leave for the user
+assert_fail "Question FP: menu without a recommended option is left alone" \
+    detect_question_prompt "$(cat <<'PANE'
+ Which auth method should we use?
+ ❯ 1. JWT tokens
+   2. Session cookies
+   3. Other
+PANE
+)"
+
+# Recommended mentioned in prose, no active menu → no detection
+assert_fail "Question FP: prose mentioning (Recommended) without a menu" \
+    detect_question_prompt "$(cat <<'PANE'
+ The config guide says:
+ Use option 1. The JWT approach is the one labelled (Recommended) in
+ the docs, so let's go with that.
+PANE
+)"
+
+# Single option is not a menu
+assert_fail "Question FP: single numbered line is not a menu" \
+    detect_question_prompt "$(cat <<'PANE'
+ ❯ 1. JWT tokens (Recommended)
+PANE
+)"
+
+# Yes/No permission prompt has no recommended label → not a question
+assert_fail "Question FP: permission prompt is not a question" \
+    detect_question_prompt "$(make_yesno_prompt "Bash" "ls /tmp")"
+
+# Claude Code's own /model picker uses lowercase "(recommended)" — that's a
+# user-driven menu the daemon must not fight. Only AskUserQuestion's
+# capital-R "(Recommended)" convention triggers.
+assert_fail "Question FP: /model picker with lowercase (recommended)" \
+    detect_question_prompt "$(cat <<'PANE'
+ Select model
+
+ ❯ 1. Default (recommended)     Opus 4.8 · best for daily use
+   2. Opus                      Most capable for complex work
+   3. Haiku                     Fastest for simple tasks
+PANE
+)"
+
+# multiSelect question rendering: checkboxes need toggling before Enter —
+# blindly confirming would submit nothing. Leave for the user.
+assert_fail "Question FP: multiSelect checkboxes are left alone" \
+    detect_question_prompt "$(cat <<'PANE'
+ Which features do you want to enable?
+
+ ❯ 1. [ ] Retry logic (Recommended)
+   2. [ ] Metrics export
+   3. [ ] Debug logging
+PANE
+)"
+
+# A markdown blockquote "> 1. ..." is not an active selection marker
+assert_fail "Question FP: markdown blockquote is not a menu marker" \
+    detect_question_prompt "$(cat <<'PANE'
+ The setup guide says:
+ > 1. Install the CLI first (Recommended)
+ > 2. Then authenticate
+ Follow those steps in order.
+PANE
+)"
+
+# A question dialog merely *displayed* high on screen (cat of a fixture) with
+# an idle shell at the bottom must not fire: no option line near the bottom.
+assert_fail "Question FP: displayed question menu with 25+ lines below" \
+    detect_question_prompt "$(cat <<'PANE'
+$ cat question-fixture.txt
+ Which auth method should we use?
+ ❯ 1. JWT tokens (Recommended)
+   2. Session cookies
+   3. Other
+line6
+line7
+line8
+line9
+line10
+line11
+line12
+line13
+line14
+line15
+line16
+line17
+line18
+line19
+line20
+line21
+line22
+line23
+line24
+line25
+line26
+line27
+line28
+line29
+line30
+$
+PANE
+)"
+
+section "question_approval_key — recommended option targeting"
+
+assert_eq "Question key: marker on recommended → Enter" \
+    "Enter" "$(question_approval_key "$_question_marker_on_recommended")"
+
+assert_eq "Question key: marker on option 1, recommended is 2 → send 2" \
+    "2" "$(question_approval_key "$_question_marker_elsewhere")"
+
+assert_eq "Question key: marker on Other, recommended is 1 → send 1" \
+    "1" "$(question_approval_key "$_question_marker_on_other")"
 
 ###############################################################################
 #                 COLLAPSED TRANSCRIPT VIEW (ctrl+o to expand)                #
@@ -2092,6 +2450,213 @@ PROMPT
 assert_ok  "Integration Yes/No: Bash prompt detected and approved" _run_integ_yesno_bash
 assert_ok  "Integration Yes/No: Bash(rm:*) prompt detected and approved" _run_integ_yesno_rm
 assert_ok  "Integration Yes/No: WebFetch prompt detected and approved" _run_integ_yesno_webfetch
+
+# ── Integration: long don't-ask-again menus and question dialogs ─────────────
+
+# Shared sed extraction for the daemon functions used by these tests,
+# including the key-selection helpers and the question detector.
+_INTEG_FULL_EXTRACT='/^declare -A LAST_APPROVED/p; /^declare -A LAST_SENT_HASH/p; /^declare -A SEND_STREAK/p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^send_should_skip()/,/^}/p; /^note_key_sent()/,/^}/p; /^detect_prompt()/,/^}/p; /^prompt_approval_key()/,/^}/p; /^detect_question_prompt()/,/^}/p; /^question_approval_key()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'
+
+_run_integ_daemon_burst() {
+    # $1 = audit log path. Runs main_loop against $_INTEG_SESSION for 2s with
+    # the full extraction list (key helpers + question detector included).
+    AUDIT_LOG="$1" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
+        timeout 2 bash -c '
+            source "'"$SCRIPT_DIR"'/lib/common.sh"
+            eval "$(sed -n '"'"''"$_INTEG_FULL_EXTRACT"''"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            AUDIT_LOG="'"$1"'"
+            SESSION_NAME="'"$_INTEG_SESSION"'"
+            POLL_INTERVAL=0.2
+            COOLDOWN_SECS=2
+            declare -A LAST_APPROVED
+            main_loop
+        ' 2>/dev/null || true
+}
+
+_run_integ_yesno_long_dontask() {
+    _integ_cleanup
+    local audit_tmp
+    audit_tmp="$(mktemp)"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" -x 80 -y 40 "cat"
+    sleep 0.3
+
+    # Long multi-line command inside the don't-ask-again option pushes
+    # "> 1. Yes" above the 20-line tail window.
+    tmux send-keys -t "$_INTEG_SESSION:test" "$(cat <<'PROMPT'
+ This command requires approval
+ Do you want to proceed?
+ > 1. Yes
+   2. Yes, and don't ask again for: timeout 120 some-utility
+      --flag-one
+      --flag-two
+      --flag-three
+      --flag-four
+      --flag-five
+      --flag-six
+      --flag-seven
+      --flag-eight
+      --flag-nine
+      --flag-ten
+      --flag-eleven
+      --flag-twelve
+      --flag-thirteen
+      --flag-fourteen
+      --flag-fifteen
+      --flag-sixteen
+      --flag-seventeen
+   3. No
+ Esc to cancel
+PROMPT
+)" ""
+    sleep 0.2
+
+    _run_integ_daemon_burst "$audit_tmp"
+
+    local result
+    result="$(cat "$audit_tmp")"
+    rm -f "$audit_tmp"
+    _integ_cleanup
+
+    [[ "$result" == *"APPROVED"* ]]
+}
+
+_run_integ_question_recommended() {
+    _integ_cleanup
+    local audit_tmp
+    audit_tmp="$(mktemp)"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "cat"
+    sleep 0.3
+
+    tmux send-keys -t "$_INTEG_SESSION:test" "$(cat <<'PROMPT'
+ Which auth method should we use?
+ ❯ 1. JWT tokens (Recommended)
+      Stateless, no session store needed
+   2. Session cookies
+      Server-side session store
+   3. Other
+      Provide your own answer
+PROMPT
+)" ""
+    sleep 0.2
+
+    _run_integ_daemon_burst "$audit_tmp"
+
+    local result
+    result="$(cat "$audit_tmp")"
+    rm -f "$audit_tmp"
+    _integ_cleanup
+
+    [[ "$result" == *"question+recommended"* ]]
+}
+
+_run_integ_question_without_recommended_ignored() {
+    _integ_cleanup
+    local audit_tmp
+    audit_tmp="$(mktemp)"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "cat"
+    sleep 0.3
+
+    tmux send-keys -t "$_INTEG_SESSION:test" "$(cat <<'PROMPT'
+ Which auth method should we use?
+ ❯ 1. JWT tokens
+   2. Session cookies
+   3. Other
+PROMPT
+)" ""
+    sleep 0.2
+
+    _run_integ_daemon_burst "$audit_tmp"
+
+    local result
+    result="$(cat "$audit_tmp")"
+    rm -f "$audit_tmp"
+    _integ_cleanup
+
+    # No recommended option — the question must be left for the user
+    [[ "$result" != *"APPROVED"* ]]
+}
+
+_run_integ_static_send_cap() {
+    _integ_cleanup
+    local audit_tmp fixture_tmp
+    audit_tmp="$(mktemp)"
+    fixture_tmp="$(mktemp)"
+
+    # A prompt-shaped pane that never reacts to keys (echo disabled, input
+    # swallowed by sleep) — the daemon must stop keying it after the cap.
+    cat > "$fixture_tmp" <<'PROMPT'
+ Bash command
+   ls /tmp
+ Permission rule Bash requires confirmation for this command.
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+PROMPT
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" \
+        "bash -c 'stty -echo 2>/dev/null; cat $fixture_tmp; exec sleep 30'"
+    sleep 0.5
+
+    # COOLDOWN_SECS=0 so only the send cap limits repeat sends
+    AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=0 \
+        timeout 4 bash -c '
+            source "'"$SCRIPT_DIR"'/lib/common.sh"
+            eval "$(sed -n '"'"''"$_INTEG_FULL_EXTRACT"''"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            AUDIT_LOG="'"$audit_tmp"'"
+            SESSION_NAME="'"$_INTEG_SESSION"'"
+            POLL_INTERVAL=0.2
+            COOLDOWN_SECS=0
+            main_loop
+        ' 2>/dev/null || true
+
+    local approved suppressed
+    approved="$(grep -c 'APPROVED' "$audit_tmp" 2>/dev/null)" || approved=0
+    suppressed="$(grep -c 'suppressed-static' "$audit_tmp" 2>/dev/null)" || suppressed=0
+    rm -f "$audit_tmp" "$fixture_tmp"
+    _integ_cleanup
+
+    # 5 sends (the cap), then exactly one suppressed-static audit line.
+    # The suppressed line itself contains "suppressed-static+<pattern>" and is
+    # logged via audit(), so subtract it from the APPROVED count.
+    (( approved - suppressed == 5 )) && (( suppressed == 1 ))
+}
+
+_run_integ_duplicate_daemon_refused() {
+    command -v flock >/dev/null 2>&1 || return 0
+    _integ_cleanup
+    local audit_tmp
+    audit_tmp="$(mktemp)"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "cat"
+    sleep 0.3
+
+    # First daemon runs the real script and holds the lock
+    bash "$SCRIPT_DIR/lib/approver-daemon.sh" "$_INTEG_SESSION" 0.2 "$audit_tmp" >/dev/null 2>&1 &
+    local first_pid=$!
+    sleep 0.7
+
+    # Second daemon for the same session must refuse and exit promptly
+    timeout 3 bash "$SCRIPT_DIR/lib/approver-daemon.sh" "$_INTEG_SESSION" 0.2 "$audit_tmp" >/dev/null 2>&1
+    local rc=$?
+
+    kill "$first_pid" 2>/dev/null
+    wait "$first_pid" 2>/dev/null
+    local result
+    result="$(cat "$audit_tmp")"
+    rm -f "$audit_tmp" "${audit_tmp}.lock"
+    _integ_cleanup
+
+    [[ "$result" == *"Duplicate daemon refused"* ]] && (( rc == 0 ))
+}
+
+assert_ok  "Integration Long menu: don't-ask-again prompt approved" _run_integ_yesno_long_dontask
+assert_ok  "Integration Question: recommended option auto-answered" _run_integ_question_recommended
+assert_ok  "Integration Question: no recommended option → left for user" _run_integ_question_without_recommended_ignored
+assert_ok  "Integration Send cap: static pane keyed at most 5 times" _run_integ_static_send_cap
+assert_ok  "Integration Lock: duplicate daemon for same session refused" _run_integ_duplicate_daemon_refused
 
 # ── Integration: Collapsed transcript view ────────────────────────────────────
 
