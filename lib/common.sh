@@ -54,6 +54,73 @@ check_prereqs() {
     return $missing
 }
 
+# ── best-model auto-selection ────────────────────────────────────────────────
+# When no -m/--model is given, the launcher picks the most capable model the
+# account can actually use: candidates are probed in order with a minimal
+# one-shot print-mode call, and the winner is cached so later launches skip
+# the probe. Claude Code's own `--fallback-model` can't do this for us — it
+# only works with --print, and yolo agents run interactive sessions.
+CLAUDE_YOLO_MODEL_CANDIDATES="${CLAUDE_YOLO_MODEL_CANDIDATES:-claude-fable-5 opus sonnet}"
+CLAUDE_YOLO_MODEL_CACHE_TTL="${CLAUDE_YOLO_MODEL_CACHE_TTL:-86400}"
+CLAUDE_YOLO_MODEL_PROBE_TIMEOUT="${CLAUDE_YOLO_MODEL_PROBE_TIMEOUT:-60}"
+
+model_cache_file() {
+    echo "$HOME/.claude-yolo/model-cache"
+}
+
+# Probe whether the account can use a model: one tiny print-mode request.
+# Exit 0 = the model answered. Kept as its own function so tests can stub it.
+claude_yolo_probe_model() {
+    local m="$1"
+    if command -v timeout &>/dev/null; then
+        timeout "$CLAUDE_YOLO_MODEL_PROBE_TIMEOUT" \
+            claude -p 'Reply with one word: ok' --model "$m" </dev/null &>/dev/null
+    else
+        claude -p 'Reply with one word: ok' --model "$m" </dev/null &>/dev/null
+    fi
+}
+
+# Print the best available model from CLAUDE_YOLO_MODEL_CANDIDATES (probed in
+# order, result cached for CLAUDE_YOLO_MODEL_CACHE_TTL seconds). Prints
+# nothing when no candidate works (auth/network down, or none permitted) —
+# the launcher then omits --model and Claude Code uses its own default.
+# Always returns 0 so `set -e` callers survive a failed resolution.
+resolve_best_model() {
+    local cache now
+    cache="$(model_cache_file)"
+    now="$(date +%s)"
+
+    if [[ -f "$cache" ]]; then
+        local cached mtime age
+        cached="$(head -1 "$cache" 2>/dev/null | tr -d '[:space:]')"
+        mtime="$(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0)"
+        age=$(( now - mtime ))
+        # A cached winner is only valid while it is still one of the current
+        # candidates — otherwise a changed CLAUDE_YOLO_MODEL_CANDIDATES would
+        # be silently ignored until the TTL expires.
+        if [[ -n "$cached" ]] && (( age >= 0 && age < CLAUDE_YOLO_MODEL_CACHE_TTL )) \
+           && [[ " $CLAUDE_YOLO_MODEL_CANDIDATES " == *" $cached "* ]]; then
+            echo "$cached"
+            return 0
+        fi
+    fi
+
+    local m
+    for m in $CLAUDE_YOLO_MODEL_CANDIDATES; do
+        log_info "Probing model availability: $m"
+        if claude_yolo_probe_model "$m"; then
+            mkdir -p "$(dirname "$cache")" 2>/dev/null || true
+            printf '%s\n' "$m" > "$cache" 2>/dev/null || true
+            echo "$m"
+            return 0
+        fi
+        log_warn "Model unavailable: $m — trying next candidate"
+    done
+
+    log_warn "No candidate model available ($CLAUDE_YOLO_MODEL_CANDIDATES) — using Claude Code's default model"
+    return 0
+}
+
 # Return a writable directory for audit logs.
 # Prefers /tmp; falls back to ~/.claude-yolo/logs (e.g. Termux where /tmp is not writable).
 log_dir() {
@@ -158,6 +225,64 @@ _ensure_trusted_sed() {
         sed -i "/\"projects\"/,/}/{s|^\(  \)}|$entry,\n\1}|}" "$settings" 2>/dev/null
     fi
     log_info "Auto-trusted directory: $dir"
+}
+
+# Write a per-session Claude Code settings file wiring a Notification hook
+# that records permission prompts as per-pane marker files. The launcher
+# passes it to each agent via `claude --settings <file>`, so the user's own
+# settings and unrelated Claude sessions are untouched.
+#
+# The hook fires when Claude Code shows a permission dialog (notification
+# type permission_prompt) and writes, to <audit-log>.waiting/<pane-id> (using
+# the $TMUX_PANE the hook process inherits from its pane): line 1 an epoch
+# timestamp, line 2 the payload JSON (newlines stripped). The write is atomic
+# (temp file + mv) so the daemon never reads a half-written marker. The
+# approver daemon uses these markers to recognize dialogs rendered off-screen
+# (e.g. an Edit diff taller than the pane), which the capture-based detectors
+# can never see; it reads the payload's message to tell a plain tool-permission
+# dialog (blind-answerable) from a plan-exit dialog (left for the user). The
+# hook is double-gated: the permission_prompt matcher restricts it on current
+# Claude Code, and a payload check keeps older versions (which ignore
+# Notification matchers) from writing markers for unrelated notifications like
+# idle_prompt.
+#
+# $1 = session audit log path. Prints the settings file path on success.
+write_notify_hook_settings() {
+    local audit_log="$1"
+    local settings_file="${audit_log}.hooks.json"
+    local waiting_dir="${audit_log}.waiting"
+
+    mkdir -p "$waiting_dir" 2>/dev/null || return 1
+    rm -f "$waiting_dir"/* 2>/dev/null || true
+
+    # The marker dir is embedded single-quoted inside a POSIX sh command that
+    # is itself embedded in JSON — escape for sh first, then for JSON. The
+    # command is a single line (semicolons, no literal newlines) so JSON
+    # encoding only has to escape backslashes and double quotes.
+    local dir_sh="${waiting_dir//\'/\'\\\'\'}"
+    local hook_cmd
+    hook_cmd="p=\$(cat 2>/dev/null); case \"\$p\" in *permission_prompt*|*'needs your permission'*|*'approval for the plan'*) [ -n \"\${TMUX_PANE:-}\" ] || exit 0; d='${dir_sh}'; mkdir -p \"\$d\" 2>/dev/null || exit 0; t=\"\$d/.tmp.\$\$.\$TMUX_PANE\"; { date +%s; printf '%s' \"\$p\" | tr -d '\\r\\n'; echo; } > \"\$t\" 2>/dev/null && mv \"\$t\" \"\$d/\$TMUX_PANE\" 2>/dev/null ;; esac; exit 0"
+
+    local cmd_json="${hook_cmd//\\/\\\\}"
+    cmd_json="${cmd_json//\"/\\\"}"
+
+    printf '{\n  "hooks": {\n    "Notification": [\n      {\n        "matcher": "permission_prompt",\n        "hooks": [\n          {\n            "type": "command",\n            "command": "%s"\n          }\n        ]\n      }\n    ]\n  }\n}\n' "$cmd_json" > "$settings_file" 2>/dev/null || return 1
+
+    # A malformed settings file would make every agent error at startup —
+    # verify it parses when a JSON parser is available.
+    if command -v python3 &>/dev/null; then
+        if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$settings_file" 2>/dev/null; then
+            rm -f "$settings_file" 2>/dev/null
+            return 1
+        fi
+    elif command -v node &>/dev/null; then
+        if ! node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$settings_file" 2>/dev/null; then
+            rm -f "$settings_file" 2>/dev/null
+            return 1
+        fi
+    fi
+
+    printf '%s\n' "$settings_file"
 }
 
 # Ensure Claude Code rings the terminal bell when a task finishes and when it

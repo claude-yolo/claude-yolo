@@ -73,11 +73,18 @@ claude-yolo "fix the login bug" "add unit tests for auth" "update the README"
 # Use a specific model
 claude-yolo -m opus "refactor the API layer"
 
+# Dial the effort level down (default: xhigh)
+claude-yolo -e medium "quick cleanup pass"
+
 # Point agents at a different project
 claude-yolo -d /path/to/project "run the test suite and fix failures"
 ```
 
 Once launched, you're inside a tmux session with one window per agent. The last window (`control`) tails the audit log in real time and accepts slash commands.
+
+### Model selection
+
+Without `-m/--model`, claude-yolo picks the most capable model your account can actually use: it probes `claude-fable-5`, then `opus`, then `sonnet` with a tiny one-shot request and launches every agent (and the worktree merge resolver) with the first one that answers. The winner is cached in `~/.claude-yolo/model-cache` for 24 hours, so only the first launch of the day pays the probe; changing `CLAUDE_YOLO_MODEL_CANDIDATES` invalidates the cache immediately if the cached model is no longer a candidate. If no candidate responds (offline, not logged in), agents launch with Claude Code's own default model. Agents also run at `--effort xhigh` by default — override with `-e/--effort`, or `-e none` to leave effort at Claude Code's default. Claude Code's own `--fallback-model` flag can't provide this fallback: it only works in print mode, and yolo agents are interactive sessions.
 
 ## Worktree mode
 
@@ -208,13 +215,21 @@ Slash commands queued via `/queue` use a similar scoped marker (`<audit-log>.sla
 | `CLAUDE_YOLO_SEND_STREAK_CAP` | `5` | Max keys sent to a pane whose content never changes (static false-positive guard) |
 | `CLAUDE_YOLO_CONTROL_INJECT_ATTEMPTS` | `100` | Max polls waiting for the control pane to be ready when injecting a `-c/--command` |
 | `CLAUDE_YOLO_CONTROL_INJECT_DELAY` | `0.1` | Pause between those polls |
+| `CLAUDE_YOLO_MODEL_CANDIDATES` | `claude-fable-5 opus sonnet` | Candidate models probed (in order) when no `-m/--model` is given |
+| `CLAUDE_YOLO_MODEL_CACHE_TTL` | `86400` | Seconds the probed best-model result is cached (`~/.claude-yolo/model-cache`) |
+| `CLAUDE_YOLO_MODEL_PROBE_TIMEOUT` | `60` | Timeout (seconds) for each model-availability probe |
 
 ## Options
 
 ```
 -s, --session NAME    Custom tmux session name (default: claude-yolo-<timestamp>)
 -d, --dir PATH        Working directory for agents (default: current directory)
--m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku)
+-m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku).
+                      Default: best available model, probed automatically
+                      (claude-fable-5 → opus → sonnet) and cached for 24h
+-e, --effort LEVEL    Effort level for each agent
+                      (low|medium|high|xhigh|max, or 'none' to omit the flag).
+                      Default: xhigh
 -p, --poll SECONDS    Approver poll interval (default: 0.3)
 -f, --file FILE       Read a multiline prompt from a text file
 -c, --command STRING  Slash command to run in the control pane after launch
@@ -237,7 +252,7 @@ install.sh options:
 
 ## How it works
 
-1. **Launcher** (`claude-yolo`) creates a tmux session and spawns one window per task, each running `claude`. At startup it also auto-trusts the working directory (so Claude Code skips the "trust this folder" prompt) and, **if you have not already set a notification preference**, configures `~/.claude/settings.json` to ring the terminal bell when a task finishes or your input is requested (`preferredNotifChannel: terminal_bell` plus a `Stop` hook). An existing channel choice or `Stop` hook is left untouched.
+1. **Launcher** (`claude-yolo`) creates a tmux session and spawns one window per task, each running `claude`. At startup it also auto-trusts the working directory (so Claude Code skips the "trust this folder" prompt) and, **if you have not already set a notification preference**, configures `~/.claude/settings.json` to ring the terminal bell when a task finishes or your input is requested (`preferredNotifChannel: terminal_bell` plus a `Stop` hook). An existing channel choice or `Stop` hook is left untouched. It also writes a per-session settings file (`<audit-log>.hooks.json`) with a `Notification` hook that records every permission dialog as a per-pane marker in `<audit-log>.waiting/`; each agent gets it via `claude --settings <file>`, so your own Claude settings and unrelated sessions are unaffected.
 2. **Control pane** (`lib/control-pane.sh`) opens the `control` window, tails the audit log, and handles slash commands such as `/loop`.
 3. **Approver daemon** (`lib/approver-daemon.sh`) runs in the background, polling every 0.3s. For each pane it:
    - Captures visible content via `tmux capture-pane`
@@ -245,6 +260,7 @@ install.sh options:
    - Sends `Enter` via `tmux send-keys` to confirm the Yes option when it is selected; if the `❯` marker sits on another option, sends the Yes option's number instead so the approval always lands on Yes
    - Auto-answers `AskUserQuestion` dialogs that carry a `(Recommended)` option — Enter when the marker is already on it, the option's number otherwise. Questions without a recommended option are left for the user
    - If the transcript is collapsed (`● Bash(...)` visible but prompt hidden), sends `Ctrl+O` to expand it first — the next poll cycle then approves
+   - Catches dialogs rendered **off-screen** — e.g. an Edit diff taller than the pane pushes the `❯ 1. Yes` options below the viewport, where `capture-pane` can never see them. The per-session Notification hook leaves a marker for the pane; when a fresh marker exists but no dialog is visible and the pane is frozen (a working agent keeps animating, a pane stuck on a dialog stops repainting), the daemon first "nudges" the window (resizes it one row down and back, forcing the TUI to re-render — a revealed dialog is then approved by the normal detectors with all their safeguards) and, if it stays invisible, sends a blind `Enter`: the dialog keeps keyboard focus with Yes preselected even when it isn't drawn
    - Applies a 2-second per-pane cooldown to prevent double-approvals
 4. **Audit log** at `/tmp/claude-yolo-<session>.log` records every approval and control event with timestamps. Each session gets its own log, so concurrent claude-yolo processes don't interfere.
 
@@ -272,6 +288,8 @@ The approver requires the primary signal plus at least one secondary signal to f
 **Question dialogs** (`AskUserQuestion`) — auto-answered only when a numbered option is labelled `(Recommended)` (case-sensitive: Claude Code's own pickers like `/model` use lowercase `(recommended)` and are left alone), an active `❯`/`›` selection marker is visible (a bare `>` — blockquotes, PS2 lines — doesn't count), and an option line sits within the last 25 lines of the pane (live dialogs render near the bottom). multiSelect questions (checkbox options) are left for the user — blind Enter would submit nothing. The daemon presses Enter if the marker is already on the recommended option, or the option's number to jump to it (the next poll cycle confirms with Enter if needed). Questions without a recommended option wait for the user.
 
 **Safety rails** — a static-pane send cap stops keying a pane after 5 sends with byte-identical content (a "prompt" that doesn't react to keys is a false positive; the audit log records `suppressed-static` once), configurable via `CLAUDE_YOLO_SEND_STREAK_CAP`. A per-session `flock` on `<audit-log>.lock` refuses duplicate daemons for the same session, so keys are never double-sent during redeploys.
+
+**Hidden-prompt rails** — the off-screen path never types blindly unless the pane has been byte-identical across consecutive polls (frozen), is not in copy-mode (the user may be scrolling), got `CLAUDE_YOLO_HIDDEN_NUDGE_MAX` repaint nudges first (default 2), and shows no box chrome (`╰`) in its bottom lines — the idle input box and every fully rendered dialog draw one, so a stale marker can never submit text someone is composing. A marker on a pane whose content *changed* is consumed without any key (the dialog was already answered — by the visual path racing the hook, or by you), and markers expire after `CLAUDE_YOLO_NOTIFY_TTL` seconds (default 600). Nudges are logged as `HIDDEN-PROMPT nudge` in the audit log, blind approvals as `hidden-blind+Enter` — both visible live in the control window.
 
 **Collapsed view** — detected when the transcript is toggled off:
 

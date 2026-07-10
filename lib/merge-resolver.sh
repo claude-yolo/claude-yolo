@@ -5,7 +5,7 @@
 # sequentially merges each worktree branch into the base branch, and
 # spawns a Claude agent to resolve any conflicts.
 #
-# Usage: merge-resolver.sh <session-name> <audit-log> [--no-cleanup] [--model MODEL]
+# Usage: merge-resolver.sh <session-name> <audit-log> [--no-cleanup] [--model MODEL] [--effort LEVEL]
 
 set -u
 
@@ -19,10 +19,12 @@ shift 2
 
 NO_CLEANUP=0
 MODEL=""
+EFFORT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-cleanup)  NO_CLEANUP=1; shift ;;
         --model)       MODEL="$2"; shift 2 ;;
+        --effort)      EFFORT="$2"; shift 2 ;;
         *)             shift ;;
     esac
 done
@@ -201,8 +203,16 @@ Do NOT modify files that are not in the conflicted list above."
 
     tmux new-window -t "$SESSION_NAME" -n "$resolve_win" -c "$REPO_DIR" 2>/dev/null || true
 
-    local cmd="cat '$tmpfile' | claude"
-    [[ -n "$MODEL" ]] && cmd="cat '$tmpfile' | claude --model $MODEL"
+    local claude_cmd="claude"
+    [[ -n "$MODEL" ]] && claude_cmd="claude --model $MODEL"
+    [[ -n "$EFFORT" ]] && claude_cmd="$claude_cmd --effort $EFFORT"
+    # Reuse the session's notify-hook settings (written by the launcher) so
+    # the resolver's permission prompts also leave off-screen markers for
+    # the approver daemon.
+    if [[ -f "${AUDIT_LOG}.hooks.json" ]]; then
+        claude_cmd="$claude_cmd --settings '${AUDIT_LOG//\'/\'\\\'\'}.hooks.json'"
+    fi
+    local cmd="cat '$tmpfile' | $claude_cmd"
     cmd="$cmd ; touch '$resolve_done'"
 
     tmux send-keys -t "$SESSION_NAME:$resolve_win" "$cmd" C-m

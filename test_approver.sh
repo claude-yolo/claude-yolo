@@ -135,7 +135,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 # Source detect_prompt, detect_collapsed and friends without running the daemon's main_loop.
 # We extract the functions only.
-eval "$(sed -n '/^declare -A LAST_APPROVED/p; /^declare -A LAST_SENT_HASH/p; /^declare -A SEND_STREAK/p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^send_should_skip()/,/^}/p; /^note_key_sent()/,/^}/p; /^detect_prompt()/,/^}/p; /^prompt_approval_key()/,/^}/p; /^detect_question_prompt()/,/^}/p; /^question_approval_key()/,/^}/p; /^detect_plan_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p; /^plan_approval_file()/,/^}/p; /^slash_approval_file()/,/^}/p; /^clear_plan_approval_marker()/,/^}/p; /^clear_slash_approval_marker()/,/^}/p; /^plan_approval_marker_valid()/,/^}/p; /^slash_approval_marker_valid()/,/^}/p' "$SCRIPT_DIR/lib/approver-daemon.sh")"
+eval "$(sed -n '/^declare -A LAST_APPROVED/p; /^declare -A LAST_SENT_HASH/p; /^declare -A SEND_STREAK/p; /^declare -A HIDDEN_NUDGES/p; /^declare -A HIDDEN_PREV_HASH/p; /^declare -A HIDDEN_CHANGES/p; /^declare -A HIDDEN_MARK_TS/p; /^declare -A HIDDEN_GATED_LOGGED/p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^audit()/,/^}/p; /^audit_event()/,/^}/p; /^in_cooldown()/,/^}/p; /^send_should_skip()/,/^}/p; /^note_key_sent()/,/^}/p; /^detect_prompt()/,/^}/p; /^prompt_approval_key()/,/^}/p; /^detect_question_prompt()/,/^}/p; /^question_approval_key()/,/^}/p; /^detect_plan_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p; /^plan_approval_file()/,/^}/p; /^slash_approval_file()/,/^}/p; /^clear_plan_approval_marker()/,/^}/p; /^clear_slash_approval_marker()/,/^}/p; /^plan_approval_marker_valid()/,/^}/p; /^slash_approval_marker_valid()/,/^}/p; /^notify_waiting_dir()/,/^}/p; /^notify_marker_fresh()/,/^}/p; /^notify_marker_ts()/,/^}/p; /^notify_marker_msg()/,/^}/p; /^notify_marker_blindable()/,/^}/p; /^clear_notify_marker()/,/^}/p; /^reset_hidden_state()/,/^}/p; /^hidden_candidate()/,/^}/p' "$SCRIPT_DIR/lib/approver-daemon.sh")"
 
 # Source build_agent_cmd from the launcher
 eval "$(sed -n '/^build_agent_cmd()/,/^}/p' "$SCRIPT_DIR/claude-yolo")"
@@ -1611,6 +1611,347 @@ _out="$(build_agent_cmd "" "task with \"double quotes\"")"
 assert_eq "build_agent_cmd: double quotes preserved" \
     "claude 'task with \"double quotes\"'" "$_out"
 
+_out="$(build_agent_cmd "" "fix the bug" "/tmp/cy.hooks.json")"
+assert_eq "build_agent_cmd: settings file flag" \
+    "claude --settings '/tmp/cy.hooks.json' 'fix the bug'" "$_out"
+
+_out="$(build_agent_cmd "opus" "fix the bug" "/tmp/cy.hooks.json")"
+assert_eq "build_agent_cmd: settings before model" \
+    "claude --settings '/tmp/cy.hooks.json' --model opus 'fix the bug'" "$_out"
+
+_out="$(build_agent_cmd "" "" "/tmp/cy.hooks.json")"
+assert_eq "build_agent_cmd: settings in interactive mode" \
+    "claude --settings '/tmp/cy.hooks.json'" "$_out"
+
+_out="$(build_agent_cmd "" "it's a task" "/tmp/o'brien.hooks.json")"
+assert_eq "build_agent_cmd: single quotes in settings path escaped" \
+    "claude --settings '/tmp/o'\\''brien.hooks.json' 'it'\\''s a task'" "$_out"
+
+_out="$(build_agent_cmd "" "$(printf 'line one\nline two')" "/tmp/cy.hooks.json")"
+assert_contains "build_agent_cmd: multiline task keeps settings flag" \
+    "$_out" "--settings '/tmp/cy.hooks.json'"
+
+_out="$(build_agent_cmd "opus" "fix the bug" "" "xhigh")"
+assert_eq "build_agent_cmd: effort after model" \
+    "claude --model opus --effort xhigh 'fix the bug'" "$_out"
+
+_out="$(build_agent_cmd "" "task" "" "max")"
+assert_eq "build_agent_cmd: effort without model" \
+    "claude --effort max 'task'" "$_out"
+
+_out="$(build_agent_cmd "claude-fable-5" "" "/tmp/cy.hooks.json" "xhigh")"
+assert_eq "build_agent_cmd: settings + model + effort, interactive" \
+    "claude --settings '/tmp/cy.hooks.json' --model claude-fable-5 --effort xhigh" "$_out"
+
+_out="$(build_agent_cmd "opus" "fix the bug" "" "")"
+assert_eq "build_agent_cmd: empty effort omits flag" \
+    "claude --model opus 'fix the bug'" "$_out"
+
+###############################################################################
+#                RESOLVE_BEST_MODEL — BEST-MODEL AUTO-SELECTION               #
+###############################################################################
+
+section "resolve_best_model — best-model auto-selection"
+
+_rbm_tmp="$(mktemp -d)"
+# Pin the knobs this section asserts against (a user-exported
+# CLAUDE_YOLO_MODEL_CANDIDATES would otherwise change candidate order and
+# fail correct code); restored after the section.
+_rbm_prev_candidates="$CLAUDE_YOLO_MODEL_CANDIDATES"
+_rbm_prev_ttl="$CLAUDE_YOLO_MODEL_CACHE_TTL"
+CLAUDE_YOLO_MODEL_CANDIDATES="claude-fable-5 opus sonnet"
+CLAUDE_YOLO_MODEL_CACHE_TTL=86400
+model_cache_file() { echo "$_rbm_tmp/model-cache"; }
+
+# Probe stub: a model is "available" iff listed in _RBM_AVAILABLE
+claude_yolo_probe_model() {
+    [[ " $_RBM_AVAILABLE " == *" $1 "* ]]
+}
+
+_RBM_AVAILABLE="claude-fable-5 opus sonnet"
+_out="$(resolve_best_model 2>/dev/null)"
+assert_eq "resolve_best_model: picks fable when available" "claude-fable-5" "$_out"
+
+assert_eq "resolve_best_model: caches the winner" \
+    "claude-fable-5" "$(head -1 "$_rbm_tmp/model-cache")"
+
+_RBM_AVAILABLE="sonnet"
+_out="$(resolve_best_model 2>/dev/null)"
+assert_eq "resolve_best_model: fresh cache short-circuits probing" \
+    "claude-fable-5" "$_out"
+
+rm -f "$_rbm_tmp/model-cache"
+_RBM_AVAILABLE="opus sonnet"
+_out="$(resolve_best_model 2>/dev/null)"
+assert_eq "resolve_best_model: falls back to opus when fable unavailable" "opus" "$_out"
+
+rm -f "$_rbm_tmp/model-cache"
+_RBM_AVAILABLE="sonnet"
+_out="$(resolve_best_model 2>/dev/null)"
+assert_eq "resolve_best_model: falls back to sonnet" "sonnet" "$_out"
+
+rm -f "$_rbm_tmp/model-cache"
+_RBM_AVAILABLE=""
+_out="$(resolve_best_model 2>/dev/null)"
+assert_eq "resolve_best_model: empty when no candidate works" "" "$_out"
+
+assert_ok "resolve_best_model: returns 0 even when no candidate works" \
+    resolve_best_model 2>/dev/null
+
+# An expired cache is re-probed
+rm -f "$_rbm_tmp/model-cache"
+_RBM_AVAILABLE="sonnet"
+resolve_best_model >/dev/null 2>&1   # caches sonnet
+CLAUDE_YOLO_MODEL_CACHE_TTL=0
+_RBM_AVAILABLE="claude-fable-5"
+_out="$(resolve_best_model 2>/dev/null)"
+assert_eq "resolve_best_model: expired cache re-probes" "claude-fable-5" "$_out"
+CLAUDE_YOLO_MODEL_CACHE_TTL=86400
+
+# A cached model that is no longer in the candidate list is discarded —
+# changing CLAUDE_YOLO_MODEL_CANDIDATES takes effect immediately
+rm -f "$_rbm_tmp/model-cache"
+_RBM_AVAILABLE="claude-fable-5 opus sonnet"
+resolve_best_model >/dev/null 2>&1   # caches claude-fable-5
+CLAUDE_YOLO_MODEL_CANDIDATES="opus sonnet"
+_out="$(resolve_best_model 2>/dev/null)"
+assert_eq "resolve_best_model: cached model outside candidates re-probes" "opus" "$_out"
+CLAUDE_YOLO_MODEL_CANDIDATES="claude-fable-5 opus sonnet"
+
+rm -rf "$_rbm_tmp"
+unset _RBM_AVAILABLE
+CLAUDE_YOLO_MODEL_CANDIDATES="$_rbm_prev_candidates"
+CLAUDE_YOLO_MODEL_CACHE_TTL="$_rbm_prev_ttl"
+
+###############################################################################
+#          NOTIFY HOOK SETTINGS — OFF-SCREEN PERMISSION PROMPT MARKERS        #
+###############################################################################
+
+section "write_notify_hook_settings — per-session notify hook"
+
+_hook_tmp="$(mktemp -d)"
+_hook_audit="$_hook_tmp/claude-yolo-hooktest.log"
+_hook_file="$(write_notify_hook_settings "$_hook_audit")"
+
+assert_eq "notify hook: prints settings path" \
+    "$_hook_audit.hooks.json" "$_hook_file"
+assert_ok "notify hook: settings file exists" test -f "$_hook_audit.hooks.json"
+assert_ok "notify hook: waiting dir created" test -d "$_hook_audit.waiting"
+assert_contains "notify hook: permission_prompt matcher" \
+    "$(cat "$_hook_audit.hooks.json")" '"matcher": "permission_prompt"'
+
+# Extract the embedded hook command with whatever JSON parser is available
+# (python3 preferred, node fallback) and exercise it exactly like Claude Code
+# would: JSON payload on stdin, TMUX_PANE in the environment. When neither
+# parser exists the block would be untestable, so emit a visible skip rather
+# than silently pass.
+_hook_cmd=""
+if command -v python3 &>/dev/null; then
+    assert_ok "notify hook: settings file is valid JSON" \
+        python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$_hook_audit.hooks.json"
+    _hook_cmd="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hooks"]["Notification"][0]["hooks"][0]["command"])' "$_hook_audit.hooks.json")"
+elif command -v node &>/dev/null; then
+    assert_ok "notify hook: settings file is valid JSON" \
+        node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$_hook_audit.hooks.json"
+    _hook_cmd="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).hooks.Notification[0].hooks[0].command)' "$_hook_audit.hooks.json")"
+fi
+
+if [[ -n "$_hook_cmd" ]]; then
+    _run_hook_cmd() {  # $1 = stdin payload, $2 = TMUX_PANE value
+        printf '%s' "$1" | TMUX_PANE="$2" sh -c "$_hook_cmd"
+    }
+
+    rm -f "$_hook_audit.waiting"/* 2>/dev/null
+    assert_ok "notify hook cmd: permission_prompt payload exits 0" \
+        _run_hook_cmd '{"hook_event_name":"Notification","message":"Claude needs your permission","notification_type":"permission_prompt"}' '%7'
+    assert_ok "notify hook cmd: writes marker named after pane" \
+        test -f "$_hook_audit.waiting/%7"
+    assert_ok "notify hook cmd: marker line 1 holds an epoch timestamp" \
+        bash -c "head -n1 '$_hook_audit.waiting/%7' | grep -qE '^[0-9]+\$'"
+    assert_ok "notify hook cmd: marker line 2 holds the payload message" \
+        grep -q '"message":"Claude needs your permission"' "$_hook_audit.waiting/%7"
+    # No temp file is left behind by the atomic write
+    assert_eq "notify hook cmd: atomic write leaves only the pane marker" \
+        "%7" "$(ls "$_hook_audit.waiting")"
+
+    # Plan notifications also carry permission_prompt, so they DO get a marker
+    # (so the daemon can nudge to reveal them) — the daemon's message gate,
+    # tested separately, is what keeps them from being blind-answered.
+    rm -f "$_hook_audit.waiting"/* 2>/dev/null
+    assert_ok "notify hook cmd: plan approval payload writes a marker" \
+        _run_hook_cmd '{"hook_event_name":"Notification","message":"Claude Code needs your approval for the plan","notification_type":"permission_prompt"}' '%8'
+    assert_ok "notify hook cmd: plan marker present" \
+        test -f "$_hook_audit.waiting/%8"
+
+    # Older Claude Code versions have no notification_type field (and may
+    # ignore the matcher) — the message text alone must still qualify.
+    rm -f "$_hook_audit.waiting"/* 2>/dev/null
+    assert_ok "notify hook cmd: legacy payload matches on message text" \
+        _run_hook_cmd '{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}' '%3'
+    assert_ok "notify hook cmd: legacy payload writes marker" \
+        test -f "$_hook_audit.waiting/%3"
+
+    # Non-permission notifications must not leave markers even if an old
+    # version routes them past the matcher.
+    rm -f "$_hook_audit.waiting"/* 2>/dev/null
+    assert_ok "notify hook cmd: idle payload exits 0" \
+        _run_hook_cmd '{"hook_event_name":"Notification","message":"Claude is waiting for your input","notification_type":"idle_prompt"}' '%7'
+    assert_fail "notify hook cmd: idle payload writes no marker" \
+        test -f "$_hook_audit.waiting/%7"
+
+    # Outside tmux there is no pane to mark — still exits 0 (hooks must not
+    # surface errors into the Claude session).
+    rm -f "$_hook_audit.waiting"/* 2>/dev/null
+    assert_ok "notify hook cmd: no TMUX_PANE exits 0" \
+        _run_hook_cmd '{"notification_type":"permission_prompt","message":"Claude needs your permission"}' ''
+    assert_eq "notify hook cmd: no TMUX_PANE writes nothing" \
+        "" "$(ls "$_hook_audit.waiting" 2>/dev/null)"
+else
+    echo "  ${_yellow}SKIP${_reset} notify hook cmd tests: no python3 or node to extract the embedded command"
+fi
+
+# Regenerating for the same session clears stale markers from a previous run
+mkdir -p "$_hook_audit.waiting"
+echo "12345" > "$_hook_audit.waiting/%9"
+write_notify_hook_settings "$_hook_audit" >/dev/null
+assert_fail "notify hook: regeneration clears stale markers" \
+    test -f "$_hook_audit.waiting/%9"
+
+rm -rf "$_hook_tmp"
+
+section "notify_marker_fresh — hidden-prompt marker validity"
+
+_marker_dir="$(mktemp -d)"
+
+_notify_fresh() {  # $1 = pane
+    CLAUDE_YOLO_WAITING_DIR="$_marker_dir" notify_marker_fresh "$1"
+}
+_notify_clear() {  # $1 = pane
+    CLAUDE_YOLO_WAITING_DIR="$_marker_dir" clear_notify_marker "$1"
+}
+
+assert_fail "notify marker: missing marker is not fresh" _notify_fresh '%1'
+
+date +%s > "$_marker_dir/%1"
+assert_ok "notify marker: current timestamp is fresh" _notify_fresh '%1'
+
+echo "$(( $(date +%s) - NOTIFY_MARKER_TTL - 10 ))" > "$_marker_dir/%2"
+assert_fail "notify marker: expired marker is not fresh" _notify_fresh '%2'
+assert_fail "notify marker: expired marker is removed" test -f "$_marker_dir/%2"
+
+echo "not-a-timestamp" > "$_marker_dir/%3"
+assert_fail "notify marker: malformed marker is not fresh" _notify_fresh '%3'
+assert_fail "notify marker: malformed marker is removed" test -f "$_marker_dir/%3"
+
+: > "$_marker_dir/%4"
+assert_fail "notify marker: empty marker is not fresh" _notify_fresh '%4'
+
+date +%s > "$_marker_dir/%5"
+_notify_clear '%5'
+assert_fail "notify marker: clear_notify_marker removes it" test -f "$_marker_dir/%5"
+
+# Without an override or AUDIT_LOG the helpers refuse quietly
+assert_fail "notify marker: no waiting dir configured" \
+    env -u CLAUDE_YOLO_WAITING_DIR -u AUDIT_LOG bash -c '
+        source "'"$SCRIPT_DIR"'/lib/common.sh"
+        eval "$(sed -n "/^NOTIFY_MARKER_TTL=/p; /^notify_waiting_dir()/,/^}/p; /^notify_marker_fresh()/,/^}/p" "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+        notify_marker_fresh "%1"
+    '
+
+# Two-line markers (timestamp + payload) as the real hook writes them: the
+# freshness check still reads the timestamp from line 1.
+_write_marker() {  # $1 = pane, $2 = message
+    printf '%s\n{"hook_event_name":"Notification","message":"%s","notification_type":"permission_prompt"}\n' \
+        "$(date +%s)" "$2" > "$_marker_dir/$1"
+}
+
+_notify_msg() { CLAUDE_YOLO_WAITING_DIR="$_marker_dir" notify_marker_msg "$1"; }
+_notify_ts() { CLAUDE_YOLO_WAITING_DIR="$_marker_dir" notify_marker_ts "$1"; }
+_notify_blindable() { CLAUDE_YOLO_WAITING_DIR="$_marker_dir" notify_marker_blindable "$1"; }
+
+_write_marker '%6' 'Claude needs your permission'
+assert_ok "notify marker: two-line marker is fresh" _notify_fresh '%6'
+_ts6="$(_notify_ts '%6')"
+assert_ok "notify marker: two-line ts is numeric" bash -c "[[ '$_ts6' =~ ^[0-9]+\$ ]]"
+assert_contains "notify marker: message extracted from line 2" \
+    "$(_notify_msg '%6')" 'Claude needs your permission'
+
+section "notify_marker_blindable — plain-tool vs reserved dialogs"
+
+# Plain tool-permission dialog (Bash/Edit/…) → blind-answerable
+_write_marker '%20' 'Claude needs your permission'
+assert_ok "blindable: plain tool-permission message" _notify_blindable '%20'
+
+# Plan-exit dialog → reserved for the user (message names the plan)
+_write_marker '%21' 'Claude Code needs your approval for the plan'
+assert_fail "blindable: plan-exit message is gated" _notify_blindable '%21'
+
+# A cwd/path containing 'plan' must NOT gate a plain tool dialog — only the
+# message field is inspected
+printf '%s\n{"cwd":"/home/user/plan-app","message":"Claude needs your permission","notification_type":"permission_prompt"}\n' \
+    "$(date +%s)" > "$_marker_dir/%22"
+assert_ok "blindable: 'plan' in cwd does not gate (message-only)" _notify_blindable '%22'
+
+# Missing message (older Claude Code) fails closed — no blind answer
+printf '%s\n' "$(date +%s)" > "$_marker_dir/%23"
+assert_fail "blindable: missing message fails closed" _notify_blindable '%23'
+
+# A hypothetical question dialog naming 'question' is gated too
+_write_marker '%24' 'Claude has a question for you'
+assert_fail "blindable: question message is gated" _notify_blindable '%24'
+
+rm -rf "$_marker_dir"
+
+section "hidden_candidate — blind-Enter eligibility"
+
+# The off-screen-dialog state: raw diff text at the pane bottom, no box chrome
+assert_ok "hidden candidate: diff-filled pane qualifies" \
+    hidden_candidate "$(cat <<'PANE'
+ 118 +    galleryIosAlts: [
+ 119 +      "Verbindungsformular von Mobile SSH auf einem iPhone",
+ 120 +      "Gespeicherte Server auf einem iPhone, organisiert",
+ 132       compareHead: "Sein Platz neben Termux und Termius",
+ 135       compareGuideTitle: "Vergleichsleitfaden",
+ 69   ],
+ 71   multiP1:d: "…",
+PANE
+)"
+
+# Idle input box draws its ╰ bottom border — never type into it blindly
+assert_fail "hidden candidate: idle input box is excluded" \
+    hidden_candidate "$(cat <<'PANE'
+ Some earlier output.
+
+ ╭──────────────────────────────────────────────╮
+ │ >                                            │
+ ╰──────────────────────────────────────────────╯
+   ? for shortcuts
+PANE
+)"
+
+# A fully rendered boxed dialog is handled by the visual detectors instead
+assert_fail "hidden candidate: rendered boxed dialog is excluded" \
+    hidden_candidate "$(cat <<'PANE'
+ ╭────────────────────────────────╮
+ │ Bash(rm:*)                     │
+ │   rm -rf /tmp/cache            │
+ │   Allow           Deny         │
+ ╰────────────────────────────────╯
+PANE
+)"
+
+# Box chrome far above the tail window does not disqualify the pane
+assert_ok "hidden candidate: old box chrome above tail window ignored" \
+    hidden_candidate "$(printf '╰──────╯\n%s\n' "$(seq 1 20 | sed 's/^/+ diff line /')")"
+
+section "audit_event — non-approval audit lines"
+
+_audit_tmp="$(mktemp)"
+AUDIT_LOG="$_audit_tmp" audit_event '%5' 'HIDDEN-PROMPT nudge 1/2'
+assert_contains "audit_event: line lands in audit log" \
+    "$(cat "$_audit_tmp")" "HIDDEN-PROMPT nudge 1/2 pane=%5"
+rm -f "$_audit_tmp"
+
 section "control-pane — Slash command parsing"
 
 _out="$(control_parse_interval "1h")"
@@ -2123,22 +2464,38 @@ assert_fail "launcher: -f nonexistent file fails" \
 # So instead of checking the exit code, verify the session was actually created.
 _test_no_args() {
     local before
-    before="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | sort || true)"
+    # The launcher runs with TMUX unset (see below), so it talks to the
+    # *default-socket* tmux server — which is a different server when this
+    # test itself runs inside tmux on a named socket. Every tmux call here
+    # must also drop TMUX so the checks and cleanup hit the same server the
+    # launcher used; otherwise the test looks for the session on the wrong
+    # server and leaks it (plus a live claude agent) on the default one.
+    before="$(env -u TMUX tmux list-sessions -F '#{session_name}' 2>/dev/null | sort || true)"
+    # Isolate HOME with a pre-seeded fresh model cache: the launcher's
+    # resolve_best_model then cache-hits instantly instead of issuing real
+    # (billed) `claude -p` probes and writing the user's real
+    # ~/.claude-yolo/model-cache; ensure_trusted/ensure_bell config writes
+    # land in the throwaway HOME too.
+    local fake_home
+    fake_home="$(mktemp -d)"
+    mkdir -p "$fake_home/.claude-yolo"
+    echo "sonnet" > "$fake_home/.claude-yolo/model-cache"
     # Unset TMUX so the launcher uses "tmux attach" (which harmlessly fails
     # when stdout is redirected) instead of "tmux switch-client" (which would
     # yank the user's current tmux client to the new session).
-    env -u TMUX bash "$SCRIPT_DIR/claude-yolo" >/dev/null 2>&1 || true
+    env -u TMUX HOME="$fake_home" bash "$SCRIPT_DIR/claude-yolo" >/dev/null 2>&1 || true
+    rm -rf "$fake_home"
     # Check that a new claude-yolo-* session was created
     local after found=0
-    after="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | sort || true)"
+    after="$(env -u TMUX tmux list-sessions -F '#{session_name}' 2>/dev/null | sort || true)"
     local s
     for s in $(comm -13 <(echo "$before") <(echo "$after") | grep '^claude-yolo-' || true); do
         found=1
-        tmux kill-session -t "$s" 2>/dev/null || true
+        env -u TMUX tmux kill-session -t "$s" 2>/dev/null || true
     done
     # Also clean up any stragglers
-    for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^claude-yolo-' || true); do
-        echo "$before" | grep -qxF "$s" || tmux kill-session -t "$s" 2>/dev/null || true
+    for s in $(env -u TMUX tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^claude-yolo-' || true); do
+        echo "$before" | grep -qxF "$s" || env -u TMUX tmux kill-session -t "$s" 2>/dev/null || true
     done
     (( found ))
 }
@@ -2196,7 +2553,7 @@ PROMPT
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 2 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^AUDIT_LOG=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2232,7 +2589,7 @@ PROMPT
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 2 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2268,7 +2625,7 @@ PROMPT
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 2 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2305,7 +2662,7 @@ OUTPUT
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 1.5 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2327,6 +2684,236 @@ assert_ok  "Integration Allow/Deny: Bash prompt detected and approved" _run_inte
 assert_ok  "Integration Allow/Deny: Bash(rm:*) prompt detected and approved" _run_integ_rm
 assert_ok  "Integration Allow/Deny: WebFetch prompt detected and approved" _run_integ_webfetch
 assert_ok  "Integration: no false positive on normal output" _run_integ_no_false_positive
+
+# ── Integration: hidden-prompt markers (Notification hook path) ──────────────
+
+# Write a two-line marker exactly as the real Notification hook does:
+# line 1 epoch timestamp, line 2 the payload JSON.
+_write_hidden_marker() {  # $1 = dir, $2 = pane_id, $3 = message
+    mkdir -p "$1"
+    printf '%s\n{"hook_event_name":"Notification","message":"%s","notification_type":"permission_prompt"}\n' \
+        "$(date +%s)" "$3" > "$1/$2"
+}
+
+# Shared daemon runner for the hidden-prompt tests: starts main_loop with the
+# full detector cascade extracted (so branch ordering matches production) and
+# CLAUDE_YOLO_WAITING_DIR pointed at $2.
+_integ_hidden_daemon() {
+    local audit_tmp="$1" waiting_dir="$2" run_secs="$3"
+    AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" \
+        timeout "$run_secs" bash -c '
+            source "'"$SCRIPT_DIR"'/lib/common.sh"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            AUDIT_LOG="'"$audit_tmp"'"
+            SESSION_NAME="'"$_INTEG_SESSION"'"
+            CLAUDE_YOLO_WAITING_DIR="'"$waiting_dir"'"
+            POLL_INTERVAL=0.2
+            COOLDOWN_SECS=2
+            declare -A LAST_APPROVED LAST_SENT_HASH SEND_STREAK HIDDEN_NUDGES HIDDEN_PREV_HASH HIDDEN_CHANGES HIDDEN_MARK_TS HIDDEN_GATED_LOGGED
+            main_loop
+        ' 2>/dev/null || true
+}
+
+# A frozen pane full of diff text, no visible dialog, fresh marker → the
+# daemon must nudge, then land a blind Enter (proven by the pane's `read`
+# completing and touching the proof file).
+_run_integ_hidden_blind() {
+    _integ_cleanup
+    local audit_tmp waiting_dir proof pane_script pane_id
+    audit_tmp="$(mktemp)"
+    waiting_dir="$audit_tmp.waiting"
+    proof="$audit_tmp.proof"
+    pane_script="$audit_tmp.pane.sh"
+
+    cat > "$pane_script" <<SCRIPT
+#!/bin/sh
+seq 1 30 | sed 's/^/+ translated diff line /'
+read _line
+touch '$proof'
+sleep 5
+SCRIPT
+    chmod +x "$pane_script"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "$pane_script"
+    sleep 0.4
+
+    pane_id="$(tmux display-message -p -t "$_INTEG_SESSION:test" '#{pane_id}')"
+    _write_hidden_marker "$waiting_dir" "$pane_id" 'Claude needs your permission'
+
+    _integ_hidden_daemon "$audit_tmp" "$waiting_dir" 4
+
+    local result marker_gone=0 proved=0
+    result="$(cat "$audit_tmp")"
+    [[ -f "$waiting_dir/$pane_id" ]] || marker_gone=1
+    [[ -f "$proof" ]] && proved=1
+    rm -rf "$audit_tmp" "$waiting_dir" "$proof" "$pane_script"
+    _integ_cleanup
+
+    [[ "$result" == *"HIDDEN-PROMPT nudge"* ]] \
+        && [[ "$result" == *"hidden-blind+Enter"* ]] \
+        && (( marker_gone )) && (( proved ))
+}
+
+# A hidden PLAN dialog (marker message names the plan) must be nudged (to try
+# to reveal it) but never blind-answered — plan approval is reserved for the
+# user. The marker is left in place for the visible path / user.
+_run_integ_hidden_plan() {
+    _integ_cleanup
+    local audit_tmp waiting_dir proof pane_script pane_id
+    audit_tmp="$(mktemp)"
+    waiting_dir="$audit_tmp.waiting"
+    proof="$audit_tmp.proof"
+    pane_script="$audit_tmp.pane.sh"
+
+    cat > "$pane_script" <<SCRIPT
+#!/bin/sh
+seq 1 30 | sed 's/^/  plan step /'
+read _line
+touch '$proof'
+sleep 5
+SCRIPT
+    chmod +x "$pane_script"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "$pane_script"
+    sleep 0.4
+
+    pane_id="$(tmux display-message -p -t "$_INTEG_SESSION:test" '#{pane_id}')"
+    _write_hidden_marker "$waiting_dir" "$pane_id" 'Claude Code needs your approval for the plan'
+
+    _integ_hidden_daemon "$audit_tmp" "$waiting_dir" 4
+
+    local result marker_present=0 proved=0
+    result="$(cat "$audit_tmp")"
+    [[ -f "$waiting_dir/$pane_id" ]] && marker_present=1
+    [[ -f "$proof" ]] && proved=1
+    rm -rf "$audit_tmp" "$waiting_dir" "$proof" "$pane_script"
+    _integ_cleanup
+
+    # Nudged, but NOT blind-answered; marker kept; the pane's read never fired.
+    [[ "$result" == *"HIDDEN-PROMPT nudge"* ]] \
+        && [[ "$result" == *"left for user"* ]] \
+        && [[ "$result" != *"hidden-blind"* ]] \
+        && (( marker_present )) && (( ! proved ))
+}
+
+# A fresh blind-answerable marker on a pane the user has scrolled into
+# copy-mode must get no nudges and no keys, and keep its marker — Enter in
+# copy-mode would destroy the user's scroll position/selection.
+_run_integ_hidden_copymode() {
+    _integ_cleanup
+    local audit_tmp waiting_dir proof pane_script pane_id
+    audit_tmp="$(mktemp)"
+    waiting_dir="$audit_tmp.waiting"
+    proof="$audit_tmp.proof"
+    pane_script="$audit_tmp.pane.sh"
+
+    cat > "$pane_script" <<SCRIPT
+#!/bin/sh
+seq 1 30 | sed 's/^/+ diff line /'
+read _line
+touch '$proof'
+sleep 5
+SCRIPT
+    chmod +x "$pane_script"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "$pane_script"
+    sleep 0.4
+
+    pane_id="$(tmux display-message -p -t "$_INTEG_SESSION:test" '#{pane_id}')"
+    _write_hidden_marker "$waiting_dir" "$pane_id" 'Claude needs your permission'
+    tmux copy-mode -t "$_INTEG_SESSION:test"
+    sleep 0.2
+
+    _integ_hidden_daemon "$audit_tmp" "$waiting_dir" 2
+
+    local result marker_present=0 proved=0
+    result="$(cat "$audit_tmp")"
+    [[ -f "$waiting_dir/$pane_id" ]] && marker_present=1
+    [[ -f "$proof" ]] && proved=1
+    rm -rf "$audit_tmp" "$waiting_dir" "$proof" "$pane_script"
+    _integ_cleanup
+
+    [[ "$result" != *"HIDDEN-PROMPT nudge"* ]] \
+        && [[ "$result" != *"hidden-blind"* ]] \
+        && (( marker_present )) && (( ! proved ))
+}
+
+# A marker on a pane that keeps producing output (a working agent) is stale —
+# the daemon must consume it without sending any key.
+_run_integ_hidden_stale() {
+    _integ_cleanup
+    local audit_tmp waiting_dir pane_script pane_id
+    audit_tmp="$(mktemp)"
+    waiting_dir="$audit_tmp.waiting"
+    pane_script="$audit_tmp.pane.sh"
+
+    cat > "$pane_script" <<'SCRIPT'
+#!/bin/sh
+while :; do date +%s%N; sleep 0.05; done
+SCRIPT
+    chmod +x "$pane_script"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "$pane_script"
+    sleep 0.4
+
+    pane_id="$(tmux display-message -p -t "$_INTEG_SESSION:test" '#{pane_id}')"
+    _write_hidden_marker "$waiting_dir" "$pane_id" 'Claude needs your permission'
+
+    _integ_hidden_daemon "$audit_tmp" "$waiting_dir" 2
+
+    local result marker_gone=0
+    result="$(cat "$audit_tmp")"
+    [[ -f "$waiting_dir/$pane_id" ]] || marker_gone=1
+    rm -rf "$audit_tmp" "$waiting_dir" "$pane_script"
+    _integ_cleanup
+
+    [[ "$result" != *"hidden-blind"* ]] \
+        && [[ "$result" != *"APPROVED"* ]] \
+        && (( marker_gone ))
+}
+
+# A frozen pane whose bottom shows input-box chrome (╰) must be nudged at
+# most, never blind-typed into — the proof file must stay absent.
+_run_integ_hidden_idle_box() {
+    _integ_cleanup
+    local audit_tmp waiting_dir proof pane_script pane_id
+    audit_tmp="$(mktemp)"
+    waiting_dir="$audit_tmp.waiting"
+    proof="$audit_tmp.proof"
+    pane_script="$audit_tmp.pane.sh"
+
+    cat > "$pane_script" <<SCRIPT
+#!/bin/sh
+seq 1 10 | sed 's/^/  output line /'
+printf '%s\n' ' ╭──────────────────────────╮' ' │ >                        │' ' ╰──────────────────────────╯'
+read _line
+touch '$proof'
+sleep 5
+SCRIPT
+    chmod +x "$pane_script"
+
+    tmux new-session -d -s "$_INTEG_SESSION" -n "test" "$pane_script"
+    sleep 0.4
+
+    pane_id="$(tmux display-message -p -t "$_INTEG_SESSION:test" '#{pane_id}')"
+    _write_hidden_marker "$waiting_dir" "$pane_id" 'Claude needs your permission'
+
+    _integ_hidden_daemon "$audit_tmp" "$waiting_dir" 2.5
+
+    local result proved=0
+    result="$(cat "$audit_tmp")"
+    [[ -f "$proof" ]] && proved=1
+    rm -rf "$audit_tmp" "$waiting_dir" "$proof" "$pane_script"
+    _integ_cleanup
+
+    [[ "$result" != *"hidden-blind"* ]] && (( ! proved ))
+}
+
+assert_ok  "Integration Hidden: frozen diff pane gets nudges then blind Enter" _run_integ_hidden_blind
+assert_ok  "Integration Hidden: hidden plan dialog nudged but never blind-answered" _run_integ_hidden_plan
+assert_ok  "Integration Hidden: copy-mode pane gets no nudges or keys, marker kept" _run_integ_hidden_copymode
+assert_ok  "Integration Hidden: stale marker on working pane consumed, no keys" _run_integ_hidden_stale
+assert_ok  "Integration Hidden: input-box chrome blocks blind Enter" _run_integ_hidden_idle_box
 
 # ── Integration: Yes/No style (real v2.x prompts) ────────────────────────────
 
@@ -2352,7 +2939,7 @@ PROMPT
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 2 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2391,7 +2978,7 @@ PROMPT
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 2 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2430,7 +3017,7 @@ PROMPT
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 2 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2455,7 +3042,7 @@ assert_ok  "Integration Yes/No: WebFetch prompt detected and approved" _run_inte
 
 # Shared sed extraction for the daemon functions used by these tests,
 # including the key-selection helpers and the question detector.
-_INTEG_FULL_EXTRACT='/^declare -A LAST_APPROVED/p; /^declare -A LAST_SENT_HASH/p; /^declare -A SEND_STREAK/p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^send_should_skip()/,/^}/p; /^note_key_sent()/,/^}/p; /^detect_prompt()/,/^}/p; /^prompt_approval_key()/,/^}/p; /^detect_question_prompt()/,/^}/p; /^question_approval_key()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'
+_INTEG_FULL_EXTRACT='/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'
 
 _run_integ_daemon_burst() {
     # $1 = audit log path. Runs main_loop against $_INTEG_SESSION for 2s with
@@ -2678,7 +3265,7 @@ _run_integ_collapsed_bash() {
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 3 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2711,7 +3298,7 @@ _run_integ_collapsed_webfetch() {
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 3 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^detect_collapsed()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2
@@ -2758,7 +3345,7 @@ PANE
     AUDIT_LOG="$audit_tmp" SESSION_NAME="$_INTEG_SESSION" POLL_INTERVAL=0.2 COOLDOWN_SECS=2 \
         timeout 1.5 bash -c '
             source "'"$SCRIPT_DIR"'/lib/common.sh"
-            eval "$(sed -n '"'"'/^declare -A LAST_APPROVED/p; /^COOLDOWN_SECS=/p; /^audit()/,/^}/p; /^in_cooldown()/,/^}/p; /^detect_prompt()/,/^}/p; /^detect_slash_picker()/,/^}/p; /^main_loop()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
+            eval "$(sed -n '"'"'/^declare -A /p; /^SEND_STREAK_CAP=/p; /^COOLDOWN_SECS=/p; /^PLAN_APPROVAL_TTL=/p; /^SLASH_APPROVAL_TTL=/p; /^NOTIFY_MARKER_TTL=/p; /^HIDDEN_NUDGE_MAX=/p; /^HIDDEN_BLIND_WINDOW=/p; /^[a-z][a-z_0-9]*()/,/^}/p'"'"' "'"$SCRIPT_DIR"'/lib/approver-daemon.sh")"
             AUDIT_LOG="'"$audit_tmp"'"
             SESSION_NAME="'"$_INTEG_SESSION"'"
             POLL_INTERVAL=0.2

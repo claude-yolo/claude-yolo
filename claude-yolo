@@ -17,7 +17,12 @@ Launch parallel Claude Code agents in tmux with auto-approval.
 Options:
   -s, --session NAME    Custom tmux session name (default: claude-yolo-<timestamp>)
   -d, --dir PATH        Working directory for agents (default: current directory)
-  -m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku)
+  -m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku).
+                        Default: best available model, probed automatically
+                        (claude-fable-5 → opus → sonnet) and cached for 24h
+  -e, --effort LEVEL    Effort level for each agent
+                        (low|medium|high|xhigh|max, or 'none' to omit the flag).
+                        Default: xhigh
   -p, --poll SECONDS    Approver poll interval (default: 0.3)
   -f, --file FILE       Read a multiline prompt from a text file
   -c, --command STRING  Slash command to run in the control pane after launch
@@ -70,7 +75,7 @@ tmux_attach() {
 }
 
 main() {
-    local session_name="" work_dir="" model="" poll_interval="0.3" resume=0 prompt_file=""
+    local session_name="" work_dir="" model="" effort="xhigh" poll_interval="0.3" resume=0 prompt_file=""
     local worktree_mode=0 base_branch="" no_merge=0 no_cleanup=0 conflict_poll="5"
     local control_command=""
     local tasks=()
@@ -81,6 +86,7 @@ main() {
             -s|--session)  session_name="$2"; shift 2 ;;
             -d|--dir)      work_dir="$2"; shift 2 ;;
             -m|--model)    model="$2"; shift 2 ;;
+            -e|--effort)   effort="$2"; shift 2 ;;
             -p|--poll)     poll_interval="$2"; shift 2 ;;
             -f|--file)     prompt_file="$2"; shift 2 ;;
             -c|--command)
@@ -105,6 +111,22 @@ main() {
 
     # Check prerequisites
     check_prereqs || exit 1
+
+    # Validate -e/--effort ('none' disables the flag entirely)
+    if [[ "$effort" == "none" ]]; then
+        effort=""
+    elif [[ -n "$effort" ]]; then
+        case "$effort" in
+            low|medium|high|xhigh|max) ;;
+            *) log_warn "Unknown effort level: $effort (expected low|medium|high|xhigh|max) — passing through" ;;
+        esac
+        # Older Claude Code CLIs lack --effort; dropping the flag beats
+        # bricking every agent pane at startup with an unknown-option error.
+        if [[ "$(claude --help 2>/dev/null)" != *--effort* ]]; then
+            log_warn "This Claude Code CLI does not support --effort — launching without it"
+            effort=""
+        fi
+    fi
 
     # Validate -c/--command
     if [[ -n "$control_command" ]]; then
@@ -193,8 +215,29 @@ main() {
         wt_create_all "$work_dir" "$SESSION_NAME" "$base_branch" "${#tasks[@]}" || exit 1
     fi
 
+    # No -m/--model given: pick the best model the account can actually use
+    # (claude-fable-5 → opus → sonnet, probed and cached — see common.sh).
+    # Runs after every cheap validation so bad invocations fail fast instead
+    # of paying a model probe first.
+    if [[ -z "$model" ]]; then
+        model="$(resolve_best_model)"
+        if [[ -n "$model" ]]; then
+            log_info "Auto-selected model: $model (override with -m/--model)"
+        fi
+    fi
+
     # Truncate audit log for this run
     : > "$AUDIT_LOG"
+
+    # Per-session Notification hook: records permission prompts as per-pane
+    # marker files so the approver daemon can recognize dialogs rendered
+    # off-screen (e.g. an Edit diff taller than the pane). Passed to each
+    # agent via --settings; the user's own Claude settings are not touched.
+    local hook_settings=""
+    if ! hook_settings="$(write_notify_hook_settings "$AUDIT_LOG")"; then
+        hook_settings=""
+        log_warn "Could not write notify-hook settings; off-screen prompt detection disabled"
+    fi
 
     log_info "Creating tmux session: $SESSION_NAME"
     log_info "Working directory: $work_dir"
@@ -210,7 +253,7 @@ main() {
         ensure_trusted "$agent_dir"
     fi
 
-    cmd="$(build_agent_cmd "$model" "$first_task")"
+    cmd="$(build_agent_cmd "$model" "$first_task" "$hook_settings" "$effort")"
     if (( worktree_mode )); then
         cmd="$cmd ; touch '$(wt_done_marker "$SESSION_NAME" 1)'"
     fi
@@ -232,7 +275,7 @@ main() {
             ensure_trusted "$agent_dir"
         fi
 
-        cmd="$(build_agent_cmd "$model" "$task")"
+        cmd="$(build_agent_cmd "$model" "$task" "$hook_settings" "$effort")"
         if (( worktree_mode )); then
             cmd="$cmd ; touch '$(wt_done_marker "$SESSION_NAME" $((i+1)))'"
         fi
@@ -263,6 +306,7 @@ main() {
             local merge_opts=""
             (( no_cleanup )) && merge_opts="$merge_opts --no-cleanup"
             [[ -n "$model" ]] && merge_opts="$merge_opts --model $model"
+            [[ -n "$effort" ]] && merge_opts="$merge_opts --effort $effort"
 
             tmux new-window -t "$SESSION_NAME" -n "merge" -c "$work_dir"
             tmux send-keys -t "$SESSION_NAME:merge" \
@@ -297,11 +341,22 @@ main() {
 }
 
 build_agent_cmd() {
-    local model="$1" task="$2"
+    local model="$1" task="$2" settings_file="${3:-}" effort="${4:-}"
     local cmd="claude"
+
+    # Per-session hook settings (see write_notify_hook_settings). Optional:
+    # without it the daemon simply has no off-screen prompt markers.
+    if [[ -n "$settings_file" ]]; then
+        local escaped_settings="${settings_file//\'/\'\\\'\'}"
+        cmd="$cmd --settings '$escaped_settings'"
+    fi
 
     if [[ -n "$model" ]]; then
         cmd="$cmd --model $model"
+    fi
+
+    if [[ -n "$effort" ]]; then
+        cmd="$cmd --effort $effort"
     fi
 
     # No task = interactive mode

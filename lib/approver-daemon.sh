@@ -29,6 +29,33 @@ declare -A LAST_SENT_HASH
 declare -A SEND_STREAK
 SEND_STREAK_CAP="${CLAUDE_YOLO_SEND_STREAK_CAP:-5}"
 
+# Hidden-prompt handling. The launcher wires a per-session Notification hook
+# into each agent (see write_notify_hook_settings in common.sh) that records
+# every permission dialog as <audit-log>.waiting/<pane-id> (line 1: epoch
+# timestamp, line 2: the hook payload). A fresh marker with no visible dialog
+# means the dialog is rendered off-screen — e.g. an Edit diff taller than the
+# pane pushes the "❯ 1. Yes" options below the viewport, where capture-pane
+# can never see them. The dialog still has keyboard focus, so the daemon first
+# nudges the window size to force a repaint (a re-rendered dialog is then
+# approved by the normal visual path with all its safeguards) and, only for a
+# plain tool-permission dialog that stays invisible, falls back to a blind
+# Enter (Yes is preselected on fresh dialogs). Plan-exit and question dialogs
+# are never blind-answered — the payload message identifies them, and they
+# need arming / Recommended handling the daemon cannot verify unseen.
+NOTIFY_MARKER_TTL="${CLAUDE_YOLO_NOTIFY_TTL:-600}"
+HIDDEN_NUDGE_MAX="${CLAUDE_YOLO_HIDDEN_NUDGE_MAX:-2}"
+# Blind Enter is only sent within this many seconds of the marker's timestamp:
+# a genuine hidden dialog is frozen from the moment it renders, so it is
+# answered within a few polls. A blind Enter attempted much later means the
+# pane froze on something else (a shell after Claude exited, a half-typed
+# command), so we decline it and let the marker expire.
+HIDDEN_BLIND_WINDOW="${CLAUDE_YOLO_HIDDEN_BLIND_WINDOW:-45}"
+declare -A HIDDEN_NUDGES
+declare -A HIDDEN_PREV_HASH
+declare -A HIDDEN_CHANGES
+declare -A HIDDEN_MARK_TS
+declare -A HIDDEN_GATED_LOGGED
+
 # Log daemon exit for debugging (catches crashes, signals, etc.)
 trap '_exit_code=$?; echo "[$(date "+%Y-%m-%d %H:%M:%S")] Daemon exited (code=$_exit_code, session=$SESSION_NAME)" >> "$AUDIT_LOG" 2>/dev/null; log_warn "Approver daemon exiting (code=$_exit_code)" 2>/dev/null' EXIT
 
@@ -38,6 +65,17 @@ audit() {
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     echo "[$ts] APPROVED pane=$pane pattern=\"$pattern\"" >> "$AUDIT_LOG" 2>/dev/null || true
     log_info "Auto-approved: pane=$pane pattern=\"$pattern\"" 2>/dev/null || true
+}
+
+# Audit-log a non-approval event (hidden-prompt nudges and the like). Lines
+# land in the same audit log the control pane tails, so the user sees them
+# live in the control window.
+audit_event() {
+    local pane="$1" event="$2"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[$ts] $event pane=$pane" >> "$AUDIT_LOG" 2>/dev/null || true
+    log_info "$event: pane=$pane" 2>/dev/null || true
 }
 
 # Returns 0 (skip) when this exact pane content has already been keyed
@@ -420,6 +458,131 @@ slash_approval_marker_valid() {
     [[ "$marker_pane" == "$pane" ]]
 }
 
+# Directory holding the per-pane permission-prompt markers written by the
+# Notification hook (see write_notify_hook_settings in common.sh).
+notify_waiting_dir() {
+    if [[ -n "${CLAUDE_YOLO_WAITING_DIR:-}" ]]; then
+        printf '%s\n' "$CLAUDE_YOLO_WAITING_DIR"
+        return 0
+    fi
+
+    [[ -n "${AUDIT_LOG:-}" ]] || return 1
+    printf '%s.waiting\n' "$AUDIT_LOG"
+}
+
+# A marker is fresh when it exists, carries a numeric epoch timestamp, and is
+# younger than NOTIFY_MARKER_TTL. Malformed and expired markers are removed.
+notify_marker_fresh() {
+    local pane="$1"
+    local dir marker ts now ttl
+
+    dir="$(notify_waiting_dir)" || return 1
+    marker="$dir/$pane"
+    [[ -f "$marker" ]] || return 1
+
+    IFS=$' \t' read -r ts _ < "$marker" 2>/dev/null || ts=""
+    if [[ ! "$ts" =~ ^[0-9]+$ ]]; then
+        rm -f "$marker" 2>/dev/null || true
+        return 1
+    fi
+
+    ttl="$NOTIFY_MARKER_TTL"
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=600
+    now="$(date +%s)"
+    if (( now - ts > ttl )); then
+        rm -f "$marker" 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
+clear_notify_marker() {
+    local pane="$1" dir
+    dir="$(notify_waiting_dir 2>/dev/null)" || return 0
+    rm -f "$dir/$pane" 2>/dev/null || true
+}
+
+# Print the marker's epoch timestamp (line 1), or fail if absent/malformed.
+notify_marker_ts() {
+    local pane="$1" dir marker ts
+    dir="$(notify_waiting_dir)" || return 1
+    marker="$dir/$pane"
+    [[ -f "$marker" ]] || return 1
+    IFS=$' \t' read -r ts _ < "$marker" 2>/dev/null || return 1
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$ts"
+}
+
+# Print the notification message the hook recorded in the marker (line 2 holds
+# the payload JSON with newlines stripped). Empty when unavailable — e.g. an
+# older Claude Code whose payload carried no message field.
+notify_marker_msg() {
+    local pane="$1" dir marker line
+    dir="$(notify_waiting_dir)" || return 1
+    marker="$dir/$pane"
+    [[ -f "$marker" ]] || return 1
+    line="$(sed -n '2p' "$marker" 2>/dev/null)" || return 1
+    printf '%s\n' "$line" | grep -oE '"message":"[^"]*"' | head -n 1
+}
+
+# Decide whether a hidden dialog may be answered blind. Only plain
+# tool-permission dialogs qualify: their message is "Claude needs your
+# permission". Plan-exit ("… needs your approval for the plan") and question
+# dialogs carry plan/approval/question wording and are reserved for the user
+# (they need per-pane arming / Recommended handling the daemon cannot verify
+# without seeing the dialog). A missing message fails closed — without
+# positive evidence it is a plain tool dialog, we do not type into the pane.
+notify_marker_blindable() {
+    local pane="$1" msg
+    msg="$(notify_marker_msg "$pane" 2>/dev/null)" || return 1
+    [[ -n "$msg" ]] || return 1
+    if printf '%s' "$msg" | grep -qiE '(plan|question|approv)'; then
+        return 1
+    fi
+    return 0
+}
+
+# Forget a pane's hidden-prompt bookkeeping: its notify marker and all
+# per-pane episode state. Called whenever an approval was delivered to the
+# pane (the marker's dialog is gone, visible or not) and whenever the marker
+# is found no longer fresh, so leftover state can never corrupt a later
+# episode on the same pane.
+reset_hidden_state() {
+    local pane="$1"
+    clear_notify_marker "$pane" 2>/dev/null || true
+    unset "HIDDEN_NUDGES[$pane]" 2>/dev/null || true
+    unset "HIDDEN_PREV_HASH[$pane]" 2>/dev/null || true
+    unset "HIDDEN_CHANGES[$pane]" 2>/dev/null || true
+    unset "HIDDEN_MARK_TS[$pane]" 2>/dev/null || true
+    unset "HIDDEN_GATED_LOGGED[$pane]" 2>/dev/null || true
+}
+
+# A pane qualifies for a blind Enter only when its bottom lines show no box
+# chrome (╰): Claude Code's idle input box and every fully rendered dialog
+# draw one, while the off-screen-dialog state this path exists for leaves raw
+# diff/file text at the bottom of the pane. Keeps a stale marker from typing
+# into an input box the user may be composing in.
+hidden_candidate() {
+    local content="$1"
+    ! printf '%s\n' "$content" | tail -n 15 | grep -q '╰'
+}
+
+# Force the pane's TUI to repaint by shrinking its window one row and growing
+# it back (two SIGWINCHes). Claude Code re-renders on resize, which usually
+# brings an off-screen dialog's options back inside the viewport. Re-enables
+# automatic window sizing afterwards so the window keeps following client
+# resizes (resize-window switches it to manual).
+nudge_pane_window() {
+    local pane="$1" win
+    win="$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" || return 1
+    [[ -n "$win" ]] || return 1
+    tmux resize-window -t "$win" -U 1 2>/dev/null || return 1
+    tmux resize-window -t "$win" -D 1 2>/dev/null || true
+    tmux set-option -w -t "$win" -u window-size 2>/dev/null || true
+    return 0
+}
+
 # Detect if the slash command autocomplete picker is visible.
 # When the user types "/p" (or similar), Claude Code shows an autocomplete popup
 # with lines like:  /plan    Enter plan mode
@@ -495,6 +658,14 @@ main_loop() {
             # Skip empty panes
             [[ -z "$content" ]] && continue
 
+            # Clear leftover hidden-prompt state once a pane's marker is gone
+            # (answered by the user, or TTL-expired). Without this, an episode
+            # that ended without a daemon send would leave stale nudge counts
+            # and hashes that corrupt the next hidden dialog on the same pane.
+            if [[ -n "${HIDDEN_PREV_HASH[$pane]:-}" ]] && ! notify_marker_fresh "$pane" 2>/dev/null; then
+                reset_hidden_state "$pane"
+            fi
+
             # Veto: slash command autocomplete picker is visible — do not send any keys
             if detect_slash_picker "$content"; then
                 continue
@@ -508,6 +679,7 @@ main_loop() {
                 if plan_approval_marker_valid "$pane"; then
                     tmux send-keys -t "$pane" Enter 2>/dev/null || continue
                     clear_plan_approval_marker
+                    reset_hidden_state "$pane" 2>/dev/null || true
                     LAST_APPROVED["$pane"]="$(date +%s)"
                     audit "$pane" "plan-control"
                 fi
@@ -521,6 +693,7 @@ main_loop() {
                 if pattern="$(detect_prompt "$content")"; then
                     tmux send-keys -t "$pane" Enter 2>/dev/null || continue
                     clear_slash_approval_marker
+                    reset_hidden_state "$pane" 2>/dev/null || true
                     LAST_APPROVED["$pane"]="$(date +%s)"
                     audit "$pane" "slash-control+$pattern"
                     continue
@@ -549,6 +722,7 @@ main_loop() {
                 [[ -n "$approve_key" ]] || approve_key="Enter"
                 tmux send-keys -t "$pane" "$approve_key" 2>/dev/null || continue
                 note_key_sent "$pane" "$content_hash" 2>/dev/null || true
+                reset_hidden_state "$pane" 2>/dev/null || true
                 LAST_APPROVED["$pane"]="$(date +%s)"
                 audit "$pane" "$pattern"
             elif pattern="$(detect_question_prompt "$content")"; then
@@ -565,6 +739,7 @@ main_loop() {
                 [[ -n "$question_key" ]] || question_key="Enter"
                 tmux send-keys -t "$pane" "$question_key" 2>/dev/null || continue
                 note_key_sent "$pane" "$content_hash" 2>/dev/null || true
+                reset_hidden_state "$pane" 2>/dev/null || true
                 LAST_APPROVED["$pane"]="$(date +%s)"
                 audit "$pane" "$pattern"
             elif pattern="$(detect_collapsed "$content")"; then
@@ -577,6 +752,93 @@ main_loop() {
                 note_key_sent "$pane" "$content_hash" 2>/dev/null || true
                 audit "$pane" "$pattern"
                 # Don't set cooldown — we need the next cycle to approve
+            elif notify_marker_fresh "$pane" 2>/dev/null; then
+                # The Notification hook reported a permission dialog for this
+                # pane, but no visual detector saw it: the dialog is rendered
+                # off-screen (e.g. an Edit diff taller than the pane). It
+                # still has keyboard focus, so it can be answered unseen.
+                # Leave the pane alone while the user scrolls in copy-mode,
+                # and without a capture hash there is nothing safe to do.
+                if [[ "$(tmux display-message -p -t "$pane" '#{pane_in_mode}' 2>/dev/null)" == "1" ]]; then
+                    continue
+                fi
+                [[ -n "$content_hash" ]] || continue
+
+                local marker_ts
+                marker_ts="$(notify_marker_ts "$pane" 2>/dev/null)" || marker_ts=""
+
+                # A new marker (different timestamp) starts a fresh episode, so
+                # leftover nudge counts / hashes from a previous dialog on this
+                # pane never carry over. Sample once, then compare next cycle.
+                if [[ "${HIDDEN_MARK_TS[$pane]:-}" != "$marker_ts" ]]; then
+                    HIDDEN_MARK_TS["$pane"]="$marker_ts"
+                    HIDDEN_NUDGES["$pane"]=0
+                    HIDDEN_CHANGES["$pane"]=0
+                    HIDDEN_PREV_HASH["$pane"]="$content_hash"
+                    unset "HIDDEN_GATED_LOGGED[$pane]" 2>/dev/null || true
+                    continue
+                fi
+
+                # A dialog stuck off-screen is frozen; a working agent (or a
+                # race where the visual path already answered) keeps changing.
+                # Require two consecutive changes before treating the marker as
+                # stale, so a single mid-render frame between the first two
+                # polls does not discard a genuine hidden dialog.
+                if [[ "${HIDDEN_PREV_HASH[$pane]:-}" != "$content_hash" ]]; then
+                    HIDDEN_PREV_HASH["$pane"]="$content_hash"
+                    HIDDEN_CHANGES["$pane"]="$(( ${HIDDEN_CHANGES[$pane]:-0} + 1 ))"
+                    if (( ${HIDDEN_CHANGES[$pane]} >= 2 )); then
+                        reset_hidden_state "$pane"
+                    fi
+                    continue
+                fi
+
+                # Frozen this cycle — reset the change run.
+                HIDDEN_CHANGES["$pane"]=0
+                local hidden_nudges="${HIDDEN_NUDGES[$pane]:-0}"
+
+                # First try repaint nudges — if the re-render brings the dialog
+                # into view, the next cycle approves it through the normal
+                # detectors with all their safeguards (plan scoping,
+                # Recommended-only questions). Nudging is harmless for any
+                # dialog type, so it is not gated.
+                if (( hidden_nudges < HIDDEN_NUDGE_MAX )) && nudge_pane_window "$pane" 2>/dev/null; then
+                    HIDDEN_NUDGES["$pane"]="$((hidden_nudges + 1))"
+                    audit_event "$pane" "HIDDEN-PROMPT nudge $((hidden_nudges + 1))/$HIDDEN_NUDGE_MAX"
+                    continue
+                fi
+
+                # Still invisible after nudging (or resize-window failed).
+                # Blind Enter is only for a plain tool-permission dialog:
+                # plan-exit and question dialogs (identified by the marker's
+                # message) need arming / Recommended handling the daemon cannot
+                # verify unseen, so they are left for the user.
+                if ! notify_marker_blindable "$pane" 2>/dev/null; then
+                    if [[ -z "${HIDDEN_GATED_LOGGED[$pane]:-}" ]]; then
+                        audit_event "$pane" "HIDDEN-PROMPT hidden dialog left for user (not a plain tool permission)"
+                        HIDDEN_GATED_LOGGED["$pane"]=1
+                    fi
+                    continue
+                fi
+
+                # Only blind-answer close to when the dialog appeared: a
+                # genuine hidden dialog is frozen from render, so it is handled
+                # within a few polls. A blind Enter attempted much later means
+                # the pane froze on something else (a shell after Claude exited,
+                # a half-typed command) — decline and let the marker expire.
+                local now
+                now="$(date +%s)"
+                if [[ ! "$marker_ts" =~ ^[0-9]+$ ]] || (( now - marker_ts > HIDDEN_BLIND_WINDOW )); then
+                    continue
+                fi
+
+                # Never type into a pane whose bottom shows box chrome (idle
+                # input box or a rendered dialog); such markers just expire.
+                hidden_candidate "$content" 2>/dev/null || continue
+                tmux send-keys -t "$pane" Enter 2>/dev/null || continue
+                reset_hidden_state "$pane" 2>/dev/null || true
+                LAST_APPROVED["$pane"]="$(date +%s)"
+                audit "$pane" "hidden-blind+Enter"
             fi
         done
 
