@@ -235,8 +235,70 @@ assert_contains "YesNo Bash: pattern includes +tool" "$_out" "+tool"
 assert_contains "YesNo Bash: pattern includes +context" "$_out" "+context"
 
 ###############################################################################
-#                 YES/NO STYLE — BASH(rm:*) PERMISSION PROMPTS                #
+#            WRITE/EDIT FILE DIALOGS — GARBLED No, ESC FOOTER                 #
 ###############################################################################
+
+section "detect_prompt — Write/Edit file dialogs (garbled No, Esc footer)"
+
+# Exact shape of a real stuck prompt (phone-width pane, 2026-07-11): the
+# Write tool's file preview scrolled the tool header off-screen, and option
+# 2's wrapped "(shift+tab)" suffix overwrote option 3, leaving "3. Nohift+tab)"
+# — so the \bNo\b option regex can never match.
+_write_dialog_garbled="$(cat <<'PANE'
+  130 "tmux": "tmux",
+  131 "v%@": "v%@",
+  132 "⚠ Keep this secret — anyone with the private key can authenticate"
+  133 }
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create hi.json?
+ ❯ 1. Yes
+   2. Yes, allow all edits in l10n-out/ during this session
+   3. Nohift+tab)
+
+ Esc to cancel · Tab to amend
+PANE
+)"
+
+assert_ok "WriteDialog: garbled No detected via Esc footer" \
+    detect_prompt "$_write_dialog_garbled"
+
+_out="$(detect_prompt "$_write_dialog_garbled")"
+assert_contains "WriteDialog: garbled No pattern is Yes+Esc" "$_out" "Yes+Esc"
+
+assert_eq "WriteDialog: garbled No approved with Enter" \
+    "Enter" "$(prompt_approval_key "$_write_dialog_garbled")"
+
+# Clean render of the same dialog still detects through the classic No path
+assert_ok "WriteDialog: clean render detected" \
+    detect_prompt "$(cat <<'PANE'
+  133 }
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create hi.json?
+ ❯ 1. Yes
+   2. Yes, allow all edits in l10n-out/ during this session (shift+tab)
+   3. No, and tell Claude what to do differently (esc)
+PANE
+)"
+
+# The Edit-tool variant's question line is enough context on its own
+assert_ok "WriteDialog: 'make this edit' question detected" \
+    detect_prompt "$(cat <<'PANE'
+ Do you want to make this edit to config.yaml?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel
+PANE
+)"
+
+# Esc footer alone (no numbered Yes option) must not fire
+assert_fail "WriteDialog: Esc footer without Yes option ignored" \
+    detect_prompt "$(cat <<'PANE'
+ Search results for "cancel":
+   help.txt: press Esc to cancel the current operation
+ Do you want to proceed with the write-up? It requires approval.
+PANE
+)"
 
 section "detect_prompt — Yes/No style: Bash(rm:*)"
 

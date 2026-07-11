@@ -160,9 +160,26 @@ detect_prompt() {
     #   in prose) from firing.
     local yes_option_re='^[[:space:]]*(│[[:space:]]*)?((❯|›|>)[[:space:]]*)?[0-9]+[.)][[:space:]]*Yes\b'
     local no_option_re='^[[:space:]]*(│[[:space:]]*)?((❯|›|>)[[:space:]]*)?[0-9]+[.)][[:space:]]*No\b'
+    local menu_via_esc=0
     if (( ! has_yes )); then
         if echo "$content" | grep -qE "$yes_option_re"; then
-            if echo "$content" | tail -n 25 | grep -qE "$no_option_re"; then
+            local tail25 menu_found=0
+            tail25="$(echo "$content" | tail -n 25)"
+            if echo "$tail25" | grep -qE "$no_option_re"; then
+                menu_found=1
+            elif echo "$tail25" | grep -qE "$yes_option_re" \
+                 && echo "$tail25" | grep -q 'Esc to cancel'; then
+                # The No option can be garbled by narrow-pane redraw
+                # collisions (observed on a phone-width pane: option 2's
+                # wrapped "(shift+tab)" suffix overwrote "3. No, and tell
+                # Claude..." leaving "3. Nohift+tab)"), which defeats the
+                # \bNo\b match. The live-dialog footer "Esc to cancel" is
+                # rendered directly under the options and survives those
+                # collisions — a Yes option in the same bottom window plus
+                # that footer also counts as a complete menu.
+                menu_found=1; menu_via_esc=1
+            fi
+            if (( menu_found )); then
                 has_yes=1; has_no=1
                 # Scope the secondary signals to the menu region — from just
                 # above the first Yes option (the "Do you want to proceed?"
@@ -185,14 +202,18 @@ detect_prompt() {
         has_tool=1
     fi
 
-    # Secondary signal 2: Contextual phrases
-    if echo "$signal_window" | grep -qiE '(want to proceed|wants to execute|wants to run|permission|allow once|allow always|trust this folder|trust this project|safety check|requires approval|requires confirmation)'; then
+    # Secondary signal 2: Contextual phrases. "want to create" / "want to
+    # make this edit" are the Write/Edit file dialogs ("Do you want to create
+    # hi.json?") — their tool header scrolls off-screen behind the file
+    # preview, so the question line is often the only evidence left.
+    if echo "$signal_window" | grep -qiE '(want to proceed|want to create|want to make this edit|wants to execute|wants to run|permission|allow once|allow always|trust this folder|trust this project|safety check|requires approval|requires confirmation)'; then
         has_context=1
     fi
 
     # Require primary signal plus at least one secondary signal
     if (( has_yes && has_no && (has_tool || has_context) )); then
         local pattern="Yes+No"
+        (( menu_via_esc )) && pattern="Yes+Esc"
         (( has_tool )) && pattern="$pattern+tool"
         (( has_context )) && pattern="$pattern+context"
         echo "$pattern"
