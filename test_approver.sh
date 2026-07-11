@@ -300,6 +300,30 @@ assert_fail "WriteDialog: Esc footer without Yes option ignored" \
 PANE
 )"
 
+# A quoted/cat'ed menu with a bare ">" marker and no No option must not fire
+# via the Esc fallback — only a real ❯/› selection marker qualifies
+assert_fail "WriteDialog: quoted fixture without live marker ignored" \
+    detect_prompt "$(cat <<'PANE'
+ $ cat docs/dialog-example.txt
+ Do you want to create hi.json?
+ > 1. Yes
+   2. Yes, allow all edits in l10n-out/ during this session
+
+ Esc to cancel · Tab to amend
+PANE
+)"
+
+# Agent narration containing "want to create" is not dialog context
+assert_fail "WriteDialog: narration 'want to create' ignored" \
+    detect_prompt "$(cat <<'PANE'
+ I want to create the localization files next. Here is the plan:
+ ❯ 1. Yes we keep the existing keys
+   2. Yesterday's extraction had gaps
+
+ Press Esc to cancel the build when done.
+PANE
+)"
+
 section "detect_prompt — Yes/No style: Bash(rm:*)"
 
 assert_ok "YesNo Bash(rm:*): rm -rf" \

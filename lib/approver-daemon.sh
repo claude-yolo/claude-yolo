@@ -168,7 +168,8 @@ detect_prompt() {
             if echo "$tail25" | grep -qE "$no_option_re"; then
                 menu_found=1
             elif echo "$tail25" | grep -qE "$yes_option_re" \
-                 && echo "$tail25" | grep -q 'Esc to cancel'; then
+                 && echo "$tail25" | grep -q 'Esc to cancel' \
+                 && echo "$tail25" | grep -qE '^[[:space:]]*(│[[:space:]]*)?(❯|›)[[:space:]]*[0-9]+[.)]'; then
                 # The No option can be garbled by narrow-pane redraw
                 # collisions (observed on a phone-width pane: option 2's
                 # wrapped "(shift+tab)" suffix overwrote "3. No, and tell
@@ -176,7 +177,11 @@ detect_prompt() {
                 # \bNo\b match. The live-dialog footer "Esc to cancel" is
                 # rendered directly under the options and survives those
                 # collisions — a Yes option in the same bottom window plus
-                # that footer also counts as a complete menu.
+                # that footer counts as a complete menu, but only alongside
+                # an *active* ❯/› selection marker on a numbered option:
+                # quoted menus in prose or cat'ed test fixtures don't render
+                # a real marker (a bare ">" doesn't count, same rule as
+                # prompt_approval_key), so this fallback can't fire on them.
                 menu_found=1; menu_via_esc=1
             fi
             if (( menu_found )); then
@@ -202,11 +207,14 @@ detect_prompt() {
         has_tool=1
     fi
 
-    # Secondary signal 2: Contextual phrases. "want to create" / "want to
-    # make this edit" are the Write/Edit file dialogs ("Do you want to create
-    # hi.json?") — their tool header scrolls off-screen behind the file
-    # preview, so the question line is often the only evidence left.
-    if echo "$signal_window" | grep -qiE '(want to proceed|want to create|want to make this edit|wants to execute|wants to run|permission|allow once|allow always|trust this folder|trust this project|safety check|requires approval|requires confirmation)'; then
+    # Secondary signal 2: Contextual phrases. The line-anchored "Do you want
+    # to create/make this edit" question is the Write/Edit file dialog ("Do
+    # you want to create hi.json?") — its tool header scrolls off-screen
+    # behind the file preview, so the question line is often the only
+    # evidence left. Anchoring to the full question at line start keeps
+    # agent narration ("I want to create a helper...") from counting.
+    if echo "$signal_window" | grep -qiE '(want to proceed|wants to execute|wants to run|permission|allow once|allow always|trust this folder|trust this project|safety check|requires approval|requires confirmation)' \
+       || echo "$signal_window" | grep -qiE '^[[:space:]]*(│[[:space:]]*)?do you want to (create|make this edit)'; then
         has_context=1
     fi
 
