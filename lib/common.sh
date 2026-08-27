@@ -60,7 +60,13 @@ check_prereqs() {
 # one-shot print-mode call, and the winner is cached so later launches skip
 # the probe. Claude Code's own `--fallback-model` can't do this for us — it
 # only works with --print, and yolo agents run interactive sessions.
-CLAUDE_YOLO_MODEL_CANDIDATES="${CLAUDE_YOLO_MODEL_CANDIDATES:-claude-fable-5 opus sonnet}"
+#
+# The default candidate is the latest opus (the `opus` alias always resolves
+# to it). Models an organization restricts are deliberately not listed: Claude
+# Code answers a restricted model's request with a permitted one instead of
+# failing, so the probe cannot tell the difference and the launcher would pin
+# every agent to a model that is silently downgraded at startup.
+CLAUDE_YOLO_MODEL_CANDIDATES="${CLAUDE_YOLO_MODEL_CANDIDATES:-opus sonnet}"
 CLAUDE_YOLO_MODEL_CACHE_TTL="${CLAUDE_YOLO_MODEL_CACHE_TTL:-86400}"
 CLAUDE_YOLO_MODEL_PROBE_TIMEOUT="${CLAUDE_YOLO_MODEL_PROBE_TIMEOUT:-60}"
 
@@ -119,6 +125,35 @@ resolve_best_model() {
 
     log_warn "No candidate model available ($CLAUDE_YOLO_MODEL_CANDIDATES) — using Claude Code's default model"
     return 0
+}
+
+# ── effort resolution ────────────────────────────────────────────────────────
+# Resolve a -e/--effort value into the two things a launch needs: the value
+# for Claude Code's --effort flag, and whether the per-session settings file
+# should turn on ultracode. Prints "<ultracode 0|1> <effort>" — ultracode
+# first so an empty effort still parses with `read -r ultracode effort`.
+#
+# 'none' (or empty) drops the flag entirely. 'ultracode' (alias 'ultra') is
+# not an --effort value at all: Claude Code takes it as a session settings key
+# (xhigh effort plus standing dynamic-workflow orchestration), so it resolves
+# to xhigh on the flag plus ultracode in the settings file — and plain xhigh
+# is exactly what it degrades to wherever ultracode is unavailable (dynamic
+# workflows off, or a model/organization without xhigh). Unknown levels are
+# passed through: a newer CLI may know a level this launcher does not.
+resolve_effort() {
+    local effort="$1"
+
+    case "$effort" in
+        none|"")
+            printf '0\n' ;;
+        ultra|ultracode)
+            printf '1 xhigh\n' ;;
+        low|medium|high|xhigh|max)
+            printf '0 %s\n' "$effort" ;;
+        *)
+            log_warn "Unknown effort level: $effort (expected ultracode|low|medium|high|xhigh|max) — passing through"
+            printf '0 %s\n' "$effort" ;;
+    esac
 }
 
 # Return a writable directory for audit logs.
@@ -246,9 +281,15 @@ _ensure_trusted_sed() {
 # Notification matchers) from writing markers for unrelated notifications like
 # idle_prompt.
 #
-# $1 = session audit log path. Prints the settings file path on success.
+# The same file carries the session's `ultracode` setting when requested
+# (-e ultracode). Ultracode — xhigh effort plus standing dynamic-workflow
+# orchestration — is session-scoped and has no CLI flag; Claude Code only
+# takes it as a settings key, which is exactly what --settings provides.
+#
+# $1 = session audit log path. $2 = 1 to enable ultracode (default 0).
+# Prints the settings file path on success.
 write_notify_hook_settings() {
-    local audit_log="$1"
+    local audit_log="$1" ultracode="${2:-0}"
     local settings_file="${audit_log}.hooks.json"
     local waiting_dir="${audit_log}.waiting"
 
@@ -266,7 +307,13 @@ write_notify_hook_settings() {
     local cmd_json="${hook_cmd//\\/\\\\}"
     cmd_json="${cmd_json//\"/\\\"}"
 
-    printf '{\n  "hooks": {\n    "Notification": [\n      {\n        "matcher": "permission_prompt",\n        "hooks": [\n          {\n            "type": "command",\n            "command": "%s"\n          }\n        ]\n      }\n    ]\n  }\n}\n' "$cmd_json" > "$settings_file" 2>/dev/null || return 1
+    local ultracode_json=""
+    if [[ "$ultracode" == "1" ]]; then
+        ultracode_json='  "ultracode": true,
+'
+    fi
+
+    printf '{\n%s  "hooks": {\n    "Notification": [\n      {\n        "matcher": "permission_prompt",\n        "hooks": [\n          {\n            "type": "command",\n            "command": "%s"\n          }\n        ]\n      }\n    ]\n  }\n}\n' "$ultracode_json" "$cmd_json" > "$settings_file" 2>/dev/null || return 1
 
     # A malformed settings file would make every agent error at startup —
     # verify it parses when a JSON parser is available.

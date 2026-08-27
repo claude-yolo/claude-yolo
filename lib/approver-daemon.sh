@@ -202,19 +202,25 @@ detect_prompt() {
         fi
     fi
 
-    # Secondary signal 1: Tool-related keywords near the prompt
-    if echo "$signal_window" | grep -qiE '(Bash|WebFetch|Read|Write|Edit|execute|run)'; then
+    # Secondary signal 1: Tool-related keywords near the prompt. "Fetch"
+    # (not just "WebFetch") because a fetch requested by a subagent renders
+    # its header as "Fetch · from the "<name>" workflow" and its body as
+    # "Claude wants to fetch content from <host>".
+    if echo "$signal_window" | grep -qiE '(Bash|Fetch|Read|Write|Edit|execute|run)'; then
         has_tool=1
     fi
 
     # Secondary signal 2: Contextual phrases. The line-anchored "Do you want
-    # to create/make this edit" question is the Write/Edit file dialog ("Do
-    # you want to create hi.json?") — its tool header scrolls off-screen
-    # behind the file preview, so the question line is often the only
-    # evidence left. Anchoring to the full question at line start keeps
+    # to …" line is the dialog's own question ("Do you want to create
+    # hi.json?", "Do you want to allow Claude to fetch this content?") — for
+    # the Write/Edit and fetch dialogs the tool header scrolls off-screen
+    # behind the file preview / fetch prompt, so the question line is often
+    # the only evidence left. Same for the "Claude wants to …" summary line
+    # the dialog prints just above it. Anchoring both to line start keeps
     # agent narration ("I want to create a helper...") from counting.
     if echo "$signal_window" | grep -qiE '(want to proceed|wants to execute|wants to run|permission|allow once|allow always|trust this folder|trust this project|safety check|requires approval|requires confirmation)' \
-       || echo "$signal_window" | grep -qiE '^[[:space:]]*(│[[:space:]]*)?do you want to (create|make this edit)'; then
+       || echo "$signal_window" | grep -qiE '^[[:space:]]*(│[[:space:]]*)?do you want to (create|make this edit|allow|use|run|execute)' \
+       || echo "$signal_window" | grep -qiE '^[[:space:]]*(│[[:space:]]*)?claude wants to '; then
         has_context=1
     fi
 
@@ -646,12 +652,14 @@ detect_collapsed() {
     fi
 
     # Must have "● ToolName(...)" — the filled circle indicates pending approval.
-    # Check the broader tail for the tool indicator line.
+    # Check the broader tail for the tool indicator line. "Fetch" is the header
+    # a subagent's fetch renders under (see detect_prompt); WebFetch stays
+    # listed ahead of it so the audited label keeps the full tool name.
     local tool_area
     tool_area="$(echo "$content" | tail -n 15)"
-    if echo "$tool_area" | grep -qE '● (Bash|WebFetch|Read|Write|Edit)\('; then
+    if echo "$tool_area" | grep -qE '● (Bash|WebFetch|Fetch|Read|Write|Edit)\('; then
         local tool
-        tool="$(echo "$tool_area" | grep -oE '● (Bash|WebFetch|Read|Write|Edit)\(' | head -1 | sed 's/● //;s/(//')"
+        tool="$(echo "$tool_area" | grep -oE '● (Bash|WebFetch|Fetch|Read|Write|Edit)\(' | head -1 | sed 's/● //;s/(//')"
         echo "collapsed+$tool"
         return 0
     fi

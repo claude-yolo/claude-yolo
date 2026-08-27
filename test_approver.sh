@@ -387,6 +387,68 @@ PANE
 _out="$(detect_prompt "$(make_yesno_prompt "WebFetch" "https://example.com")")"
 assert_contains "YesNo WebFetch: pattern includes +tool" "$_out" "+tool"
 
+# Exact shape of a real stuck prompt (phone-width pane, 2026-08-27): a fetch
+# requested by a workflow subagent. Its header reads "Fetch" (not
+# "WebFetch"), the long prompt argument pushes that header out of the menu
+# region, and the question is "Do you want to allow Claude to fetch this
+# content?" — which matched none of the old tool keywords or context phrases,
+# so the dialog sat unanswered.
+_fetch_dialog_subagent="$(cat <<'PANE'
+ One caveat on process: one of the 22 review agents never returned, so I
+ acted on 21 verdicts rather than the full set.
+
+✳ Waiting for 1 dynamic workflow to finish
+
+ Fetch · from the "review-onscreen-batch" workflow
+
+   url: https://sw.kovidgoyal.net/kitty/graphics-protocol/
+   │ prompt: What happens when a client transmits an image with the SAME
+     image id (i=) as a previously transmitted image — is the old image
+     replaced, and are its existing placements deleted? Quote the exact
+     wording about image ids being reused/replaced and about placement
+     ids.
+  Claude wants to fetch content from sw.kovidgoyal.net
+
+Do you want to allow Claude to fetch this content?
+❯ 1. Yes
+  2. Yes, and don't ask again for sw.kovidgoyal.net
+  3. No, and tell Claude what to do differently (esc)
+PANE
+)"
+
+assert_ok "Fetch dialog: subagent fetch prompt detected" \
+    detect_prompt "$_fetch_dialog_subagent"
+
+assert_eq "Fetch dialog: approved with Enter (marker on 1. Yes)" \
+    "Enter" "$(prompt_approval_key "$_fetch_dialog_subagent")"
+
+# Both new signals must carry it on their own: the "Claude wants to fetch"
+# summary line and the "Do you want to allow" question are each enough
+# context, and "fetch" alone satisfies the tool keyword.
+assert_ok "Fetch dialog: question line alone is enough context" \
+    detect_prompt "$(cat <<'PANE'
+   file: /etc/hosts
+
+Do you want to allow Claude to read this file?
+❯ 1. Yes
+  2. Yes, and don't ask again this session
+  3. No, and tell Claude what to do differently (esc)
+PANE
+)"
+
+_out="$(detect_prompt "$_fetch_dialog_subagent")"
+assert_contains "Fetch dialog: pattern includes +tool" "$_out" "+tool"
+assert_contains "Fetch dialog: pattern includes +context" "$_out" "+context"
+
+# Prose that merely talks about fetching must still not fire — the numbered
+# Yes/No menu at the pane bottom is what makes it a dialog.
+assert_fail "Fetch dialog: narration about fetching ignored" \
+    detect_prompt "$(cat <<'PANE'
+ I want to allow the client to fetch this content lazily. Do you want to
+ allow that? I listed the options in docs/fetching.md.
+PANE
+)"
+
 ###############################################################################
 #              YES/NO STYLE — FALSE POSITIVE RESISTANCE                       #
 ###############################################################################
@@ -925,6 +987,16 @@ _out="$(detect_collapsed "$(cat <<'PANE'
 PANE
 )")"
 assert_contains "Collapsed: WebFetch pattern" "$_out" "collapsed+WebFetch"
+
+# A subagent's fetch renders under the shorter "Fetch" header
+_out="$(detect_collapsed "$(cat <<'PANE'
+● Fetch(https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+
+──────────────────────────────────────────────────────────────────────────────
+  Showing detailed transcript · ctrl+o to toggle · ctrl+e to show all
+PANE
+)")"
+assert_contains "Collapsed: Fetch pattern" "$_out" "collapsed+Fetch"
 
 section "detect_collapsed — False positive resistance"
 
@@ -1745,6 +1817,13 @@ _rbm_tmp="$(mktemp -d)"
 # fail correct code); restored after the section.
 _rbm_prev_candidates="$CLAUDE_YOLO_MODEL_CANDIDATES"
 _rbm_prev_ttl="$CLAUDE_YOLO_MODEL_CACHE_TTL"
+
+# The shipped default: latest opus first, sonnet behind it. Read from a clean
+# environment so an exported override in the caller's shell cannot mask it.
+assert_eq "resolve_best_model: default candidates are opus then sonnet" \
+    "opus sonnet" \
+    "$(env -u CLAUDE_YOLO_MODEL_CANDIDATES bash -c 'source "$1/lib/common.sh"; printf "%s" "$CLAUDE_YOLO_MODEL_CANDIDATES"' _ "$SCRIPT_DIR")"
+
 CLAUDE_YOLO_MODEL_CANDIDATES="claude-fable-5 opus sonnet"
 CLAUDE_YOLO_MODEL_CACHE_TTL=86400
 model_cache_file() { echo "$_rbm_tmp/model-cache"; }
@@ -1903,7 +1982,69 @@ write_notify_hook_settings "$_hook_audit" >/dev/null
 assert_fail "notify hook: regeneration clears stale markers" \
     test -f "$_hook_audit.waiting/%9"
 
+# Ultracode rides along in the same settings file (it has no CLI flag)
+assert_fail "notify hook: no ultracode key by default" \
+    grep -q 'ultracode' "$_hook_audit.hooks.json"
+
+write_notify_hook_settings "$_hook_audit" 1 >/dev/null
+assert_ok "notify hook: ultracode key written when requested" \
+    grep -q '"ultracode": true' "$_hook_audit.hooks.json"
+assert_contains "notify hook: ultracode keeps the notify hook" \
+    "$(cat "$_hook_audit.hooks.json")" '"matcher": "permission_prompt"'
+if command -v python3 &>/dev/null; then
+    assert_ok "notify hook: ultracode settings file is valid JSON" \
+        python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); assert s["ultracode"] is True' \
+        "$_hook_audit.hooks.json"
+elif command -v node &>/dev/null; then
+    assert_ok "notify hook: ultracode settings file is valid JSON" \
+        node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if (s.ultracode !== true) process.exit(1)' \
+        "$_hook_audit.hooks.json"
+fi
+
 rm -rf "$_hook_tmp"
+
+###############################################################################
+#                    RESOLVE_EFFORT — EFFORT LEVEL MAPPING                    #
+###############################################################################
+
+section "resolve_effort — --effort value and ultracode setting"
+
+# Prints "<ultracode> <effort>"; ultracode has no CLI flag, so it resolves to
+# xhigh on the flag plus the settings key — which is also the level it
+# degrades to where ultracode is unavailable.
+assert_eq "resolve_effort: ultracode → xhigh + setting" \
+    "1 xhigh" "$(resolve_effort ultracode)"
+assert_eq "resolve_effort: 'ultra' is an alias for ultracode" \
+    "1 xhigh" "$(resolve_effort ultra)"
+assert_eq "resolve_effort: xhigh alone does not enable ultracode" \
+    "0 xhigh" "$(resolve_effort xhigh)"
+assert_eq "resolve_effort: max passes through" \
+    "0 max" "$(resolve_effort max)"
+assert_eq "resolve_effort: low passes through" \
+    "0 low" "$(resolve_effort low)"
+assert_eq "resolve_effort: none drops the flag" \
+    "0" "$(resolve_effort none)"
+assert_eq "resolve_effort: empty drops the flag" \
+    "0" "$(resolve_effort '')"
+assert_eq "resolve_effort: unknown level passes through" \
+    "0 turbo" "$(resolve_effort turbo 2>/dev/null)"
+
+# The launcher parses the two fields with `read`; an empty effort must not
+# shift ultracode into the effort variable.
+_re_ultracode="" _re_effort="unset"
+read -r _re_ultracode _re_effort <<< "$(resolve_effort none)"
+assert_eq "resolve_effort: read keeps ultracode=0 when effort is empty" \
+    "0" "$_re_ultracode"
+assert_eq "resolve_effort: read leaves effort empty for none" \
+    "" "$_re_effort"
+
+read -r _re_ultracode _re_effort <<< "$(resolve_effort ultracode)"
+assert_eq "resolve_effort: read gets ultracode=1" "1" "$_re_ultracode"
+assert_eq "resolve_effort: read gets effort=xhigh" "xhigh" "$_re_effort"
+
+# The launcher's shipped default
+assert_ok "claude-yolo: default effort is ultracode" \
+    grep -q 'effort="ultracode"' "$SCRIPT_DIR/claude-yolo"
 
 section "notify_marker_fresh — hidden-prompt marker validity"
 

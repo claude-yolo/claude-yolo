@@ -73,7 +73,7 @@ claude-yolo "fix the login bug" "add unit tests for auth" "update the README"
 # Use a specific model
 claude-yolo -m opus "refactor the API layer"
 
-# Dial the effort level down (default: xhigh)
+# Dial the effort level down (default: ultracode)
 claude-yolo -e medium "quick cleanup pass"
 
 # Point agents at a different project
@@ -84,7 +84,13 @@ Once launched, you're inside a tmux session with one window per agent. The last 
 
 ### Model selection
 
-Without `-m/--model`, claude-yolo picks the most capable model your account can actually use: it probes `claude-fable-5`, then `opus`, then `sonnet` with a tiny one-shot request and launches every agent (and the worktree merge resolver) with the first one that answers. The winner is cached in `~/.claude-yolo/model-cache` for 24 hours, so only the first launch of the day pays the probe; changing `CLAUDE_YOLO_MODEL_CANDIDATES` invalidates the cache immediately if the cached model is no longer a candidate. If no candidate responds (offline, not logged in), agents launch with Claude Code's own default model. Agents also run at `--effort xhigh` by default — override with `-e/--effort`, or `-e none` to leave effort at Claude Code's default. Claude Code's own `--fallback-model` flag can't provide this fallback: it only works in print mode, and yolo agents are interactive sessions.
+Without `-m/--model`, claude-yolo picks the most capable model your account can actually use: it probes `opus` (the alias always resolves to the latest one), then `sonnet`, with a tiny one-shot request and launches every agent (and the worktree merge resolver) with the first one that answers. The winner is cached in `~/.claude-yolo/model-cache` for 24 hours, so only the first launch of the day pays the probe; changing `CLAUDE_YOLO_MODEL_CANDIDATES` invalidates the cache immediately if the cached model is no longer a candidate. If no candidate responds (offline, not logged in), agents launch with Claude Code's own default model. Claude Code's own `--fallback-model` flag can't provide this fallback: it only works in print mode, and yolo agents are interactive sessions.
+
+Models your organization restricts are deliberately not probed by default. Claude Code answers a request for a restricted model with a permitted one instead of failing (`Model "X" is restricted by your organization's settings. Using Y instead.`), so the probe cannot tell the difference — it would pin every agent to a model that is silently downgraded at startup. Add one to `CLAUDE_YOLO_MODEL_CANDIDATES` only if your account is actually allowed to use it.
+
+### Effort level
+
+Agents run at `-e ultracode` by default — xhigh effort plus standing dynamic-workflow orchestration. Ultracode has no CLI flag (Claude Code takes it as a session setting), so claude-yolo puts it in the per-session settings file it already passes to each agent with `--settings`, and launches them at `--effort xhigh`. That is also what ultracode degrades to wherever it is unavailable: dynamic workflows switched off, or a model/organization without xhigh. Override with `-e/--effort` (`ultracode|low|medium|high|xhigh|max`), or `-e none` to leave effort at Claude Code's default.
 
 ## Worktree mode
 
@@ -215,7 +221,7 @@ Slash commands queued via `/queue` use a similar scoped marker (`<audit-log>.sla
 | `CLAUDE_YOLO_SEND_STREAK_CAP` | `5` | Max keys sent to a pane whose content never changes (static false-positive guard) |
 | `CLAUDE_YOLO_CONTROL_INJECT_ATTEMPTS` | `100` | Max polls waiting for the control pane to be ready when injecting a `-c/--command` |
 | `CLAUDE_YOLO_CONTROL_INJECT_DELAY` | `0.1` | Pause between those polls |
-| `CLAUDE_YOLO_MODEL_CANDIDATES` | `claude-fable-5 opus sonnet` | Candidate models probed (in order) when no `-m/--model` is given |
+| `CLAUDE_YOLO_MODEL_CANDIDATES` | `opus sonnet` | Candidate models probed (in order) when no `-m/--model` is given |
 | `CLAUDE_YOLO_MODEL_CACHE_TTL` | `86400` | Seconds the probed best-model result is cached (`~/.claude-yolo/model-cache`) |
 | `CLAUDE_YOLO_MODEL_PROBE_TIMEOUT` | `60` | Timeout (seconds) for each model-availability probe |
 
@@ -226,10 +232,12 @@ Slash commands queued via `/queue` use a similar scoped marker (`<audit-log>.sla
 -d, --dir PATH        Working directory for agents (default: current directory)
 -m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku).
                       Default: best available model, probed automatically
-                      (claude-fable-5 → opus → sonnet) and cached for 24h
--e, --effort LEVEL    Effort level for each agent
-                      (low|medium|high|xhigh|max, or 'none' to omit the flag).
-                      Default: xhigh
+                      (opus → sonnet) and cached for 24h
+-e, --effort LEVEL    Effort level for each agent (ultracode|low|medium|high|
+                      xhigh|max, or 'none' to omit the flag).
+                      Default: ultracode — xhigh effort plus dynamic
+                      workflow orchestration (falls back to plain xhigh
+                      where ultracode is unavailable)
 -p, --poll SECONDS    Approver poll interval (default: 0.3)
 -f, --file FILE       Read a multiline prompt from a text file
 -c, --command STRING  Slash command to run in the control pane after launch

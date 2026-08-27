@@ -19,10 +19,12 @@ Options:
   -d, --dir PATH        Working directory for agents (default: current directory)
   -m, --model MODEL     Claude model to use (e.g., opus, sonnet, haiku).
                         Default: best available model, probed automatically
-                        (claude-fable-5 → opus → sonnet) and cached for 24h
-  -e, --effort LEVEL    Effort level for each agent
-                        (low|medium|high|xhigh|max, or 'none' to omit the flag).
-                        Default: xhigh
+                        (opus → sonnet) and cached for 24h
+  -e, --effort LEVEL    Effort level for each agent (ultracode|low|medium|high|
+                        xhigh|max, or 'none' to omit the flag).
+                        Default: ultracode — xhigh effort plus dynamic
+                        workflow orchestration (falls back to plain xhigh
+                        where ultracode is unavailable)
   -p, --poll SECONDS    Approver poll interval (default: 0.3)
   -f, --file FILE       Read a multiline prompt from a text file
   -c, --command STRING  Slash command to run in the control pane after launch
@@ -75,7 +77,8 @@ tmux_attach() {
 }
 
 main() {
-    local session_name="" work_dir="" model="" effort="xhigh" poll_interval="0.3" resume=0 prompt_file=""
+    local session_name="" work_dir="" model="" effort="ultracode" poll_interval="0.3" resume=0 prompt_file=""
+    local ultracode=0
     local worktree_mode=0 base_branch="" no_merge=0 no_cleanup=0 conflict_poll="5"
     local control_command=""
     local tasks=()
@@ -112,20 +115,17 @@ main() {
     # Check prerequisites
     check_prereqs || exit 1
 
-    # Validate -e/--effort ('none' disables the flag entirely)
-    if [[ "$effort" == "none" ]]; then
+    # Resolve -e/--effort into the --effort flag value plus the ultracode
+    # session setting ('none' disables both) — see resolve_effort in common.sh.
+    read -r ultracode effort <<< "$(resolve_effort "$effort")"
+
+    # Older Claude Code CLIs lack --effort; dropping the flag beats bricking
+    # every agent pane at startup with an unknown-option error. Such a CLI
+    # predates the ultracode setting too, so drop that as well.
+    if [[ -n "$effort" && "$(claude --help 2>/dev/null)" != *--effort* ]]; then
+        log_warn "This Claude Code CLI does not support --effort — launching without it"
         effort=""
-    elif [[ -n "$effort" ]]; then
-        case "$effort" in
-            low|medium|high|xhigh|max) ;;
-            *) log_warn "Unknown effort level: $effort (expected low|medium|high|xhigh|max) — passing through" ;;
-        esac
-        # Older Claude Code CLIs lack --effort; dropping the flag beats
-        # bricking every agent pane at startup with an unknown-option error.
-        if [[ "$(claude --help 2>/dev/null)" != *--effort* ]]; then
-            log_warn "This Claude Code CLI does not support --effort — launching without it"
-            effort=""
-        fi
+        ultracode=0
     fi
 
     # Validate -c/--command
@@ -216,7 +216,7 @@ main() {
     fi
 
     # No -m/--model given: pick the best model the account can actually use
-    # (claude-fable-5 → opus → sonnet, probed and cached — see common.sh).
+    # (opus → sonnet, probed and cached — see common.sh).
     # Runs after every cheap validation so bad invocations fail fast instead
     # of paying a model probe first.
     if [[ -z "$model" ]]; then
@@ -229,14 +229,20 @@ main() {
     # Truncate audit log for this run
     : > "$AUDIT_LOG"
 
-    # Per-session Notification hook: records permission prompts as per-pane
-    # marker files so the approver daemon can recognize dialogs rendered
-    # off-screen (e.g. an Edit diff taller than the pane). Passed to each
-    # agent via --settings; the user's own Claude settings are not touched.
+    # Per-session settings file: the Notification hook that records permission
+    # prompts as per-pane marker files (so the approver daemon can recognize
+    # dialogs rendered off-screen, e.g. an Edit diff taller than the pane),
+    # plus the session's ultracode setting when -e ultracode is in effect.
+    # Passed to each agent via --settings; the user's own Claude settings are
+    # not touched.
     local hook_settings=""
-    if ! hook_settings="$(write_notify_hook_settings "$AUDIT_LOG")"; then
+    if ! hook_settings="$(write_notify_hook_settings "$AUDIT_LOG" "$ultracode")"; then
         hook_settings=""
-        log_warn "Could not write notify-hook settings; off-screen prompt detection disabled"
+        local lost="off-screen prompt detection"
+        (( ultracode )) && lost="$lost and ultracode"
+        log_warn "Could not write per-session settings; $lost disabled"
+    elif (( ultracode )); then
+        log_info "Effort: ultracode (xhigh + dynamic workflow orchestration)"
     fi
 
     log_info "Creating tmux session: $SESSION_NAME"
