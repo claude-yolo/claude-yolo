@@ -7,6 +7,7 @@ source "$SCRIPT_DIR/lib/common.sh"
 
 SESSION_NAME=""
 AUDIT_LOG=""
+CLAUDE_YOLO_TMUX_SOCKET=""
 
 usage() {
     cat <<'EOF'
@@ -55,6 +56,142 @@ Examples:
 EOF
 }
 
+# Print the process and each of its ancestors, stopping safely at init.
+claude_yolo_process_ancestors() {
+    local pid="${1:-$BASHPID}"
+    local parent_pid seen=" "
+
+    while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+        [[ "$seen" != *" $pid "* ]] || break
+        printf '%s\n' "$pid"
+        seen+="$pid "
+
+        parent_pid="$(ps -o ppid= -p "$pid" 2>/dev/null)" || break
+        parent_pid="${parent_pid//[[:space:]]/}"
+        pid="$parent_pid"
+    done
+}
+
+# Resolve the socket of the tmux server that owns the invoking shell. Mobile
+# SSH and other control-mode clients can leave a stale/default TMUX value after
+# moving a terminal between `tmux -L` servers. The owning tmux server remains
+# in the shell's process ancestry, so validate TMUX against that PID and scan
+# sibling sockets only when it does not match.
+claude_yolo_detect_tmux_socket() {
+    local start_pid="${1:-$BASHPID}"
+    local tmux_env="${TMUX:-}"
+    local declared_socket="${tmux_env%%,*}"
+    local socket_dir="${declared_socket%/*}"
+    local ancestors server_pid candidate
+
+    [[ -n "$tmux_env" && -n "$declared_socket" ]] || return 1
+    ancestors=" $(claude_yolo_process_ancestors "$start_pid" | tr '\n' ' ') "
+
+    server_pid="$(command tmux -S "$declared_socket" display-message -p '#{pid}' 2>/dev/null)" || true
+    if [[ -n "$server_pid" && "$ancestors" == *" $server_pid "* ]]; then
+        printf '%s\n' "$declared_socket"
+        return 0
+    fi
+
+    if [[ -d "$socket_dir" ]]; then
+        for candidate in "$socket_dir"/*; do
+            [[ -S "$candidate" && "$candidate" != "$declared_socket" ]] || continue
+            server_pid="$(command tmux -S "$candidate" display-message -p '#{pid}' 2>/dev/null)" || continue
+            if [[ -n "$server_pid" && "$ancestors" == *" $server_pid "* ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+    fi
+
+    # Preserve normal tmux behavior if process inspection is unavailable.
+    printf '%s\n' "$declared_socket"
+}
+
+claude_yolo_init_tmux_socket() {
+    local start_pid="${1:-$BASHPID}"
+    local tmux_env="${TMUX:-}"
+    local declared_socket="${tmux_env%%,*}"
+    local server_pid session_id
+
+    [[ -n "$tmux_env" ]] || return 0
+    CLAUDE_YOLO_TMUX_SOCKET="$(claude_yolo_detect_tmux_socket "$start_pid")" || true
+    [[ -n "$CLAUDE_YOLO_TMUX_SOCKET" ]] || return 0
+    if [[ "$CLAUDE_YOLO_TMUX_SOCKET" != "$declared_socket" ]]; then
+        log_info "Reusing owning tmux server socket: ${CLAUDE_YOLO_TMUX_SOCKET##*/} (TMUX reported ${declared_socket##*/})"
+    fi
+
+    # Detached helpers inherit TMUX and invoke tmux directly, so repair the
+    # environment as well as routing launcher commands through tmux_run.
+    server_pid="$(command tmux -S "$CLAUDE_YOLO_TMUX_SOCKET" \
+        display-message -p '#{pid}' 2>/dev/null)" || server_pid=""
+    session_id="${TMUX##*,}"
+    if [[ -n "${TMUX_PANE:-}" ]]; then
+        local detected_session_id
+        detected_session_id="$(command tmux -S "$CLAUDE_YOLO_TMUX_SOCKET" \
+            display-message -p -t "$TMUX_PANE" '#{session_id}' 2>/dev/null)" || detected_session_id=""
+        [[ -z "$detected_session_id" ]] || session_id="${detected_session_id#\$}"
+    fi
+    if [[ -n "$server_pid" ]]; then
+        TMUX="$CLAUDE_YOLO_TMUX_SOCKET,$server_pid,$session_id"
+        export TMUX
+    fi
+    export CLAUDE_YOLO_TMUX_SOCKET
+}
+
+# Run tmux against the resolved server rather than allowing a default-socket
+# fallback.
+tmux_run() {
+    local socket_path="${CLAUDE_YOLO_TMUX_SOCKET:-}"
+
+    if [[ -z "$socket_path" && -n "${TMUX:-}" ]]; then
+        socket_path="${TMUX%%,*}"
+    fi
+
+    if [[ -n "$socket_path" ]]; then
+        command tmux -S "$socket_path" "$@"
+    else
+        command tmux "$@"
+    fi
+}
+
+# Resolve the tmux client displaying the session that owns the invoking pane.
+# tmux normally infers this for switch-client, but command clients connected to
+# a named server can report "no current client" even while the pane is attached.
+tmux_current_client() {
+    local source_session=""
+    local activity client
+    local best_activity=-1 best_client=""
+
+    if [[ -n "${TMUX_PANE:-}" ]]; then
+        source_session="$(tmux_run display-message -p -t "$TMUX_PANE" '#{session_id}' 2>/dev/null)" || true
+    fi
+
+    # TMUX's final field is the numeric ID of the session that created the
+    # pane environment. Use it when TMUX_PANE is unavailable or stale.
+    if [[ -z "$source_session" ]]; then
+        local source_session_id="${TMUX##*,}"
+        if [[ "$source_session_id" =~ ^[0-9]+$ ]]; then
+            source_session="\$$source_session_id"
+        fi
+    fi
+
+    [[ -n "$source_session" ]] || return 1
+
+    while IFS='|' read -r activity client; do
+        [[ -n "$client" ]] || continue
+        [[ "$activity" =~ ^[0-9]+$ ]] || activity=0
+        if (( activity > best_activity )); then
+            best_activity="$activity"
+            best_client="$client"
+        fi
+    done < <(tmux_run list-clients -t "$source_session" \
+        -F '#{client_activity}|#{client_name}' 2>/dev/null)
+
+    [[ -n "$best_client" ]] || return 1
+    printf '%s\n' "$best_client"
+}
+
 # Inject a one-shot slash command into a session's control pane (used by -c/--command).
 inject_control_command() {
     local script_dir="$1" session="$2" audit_log="$3" command="$4"
@@ -70,9 +207,15 @@ tmux_attach() {
     local target="$1"
     if [[ -n "${TMUX:-}" ]]; then
         # Already inside tmux — switch the current client to the new session
-        tmux switch-client -t "$target"
+        local current_client=""
+        current_client="$(tmux_current_client)" || true
+        if [[ -n "$current_client" ]]; then
+            tmux_run switch-client -c "$current_client" -t "$target"
+        else
+            tmux_run switch-client -t "$target"
+        fi
     else
-        tmux attach -t "$target"
+        tmux_run attach -t "$target"
     fi
 }
 
@@ -112,6 +255,8 @@ main() {
         esac
     done
 
+    claude_yolo_init_tmux_socket
+
     # Check prerequisites
     check_prereqs || exit 1
 
@@ -139,7 +284,7 @@ main() {
     # Handle --resume
     if (( resume )); then
         local existing
-        existing="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^claude-yolo-' | head -1)" || true
+        existing="$(tmux_run list-sessions -F '#{session_name}' 2>/dev/null | grep '^claude-yolo-' | head -1)" || true
         if [[ -z "$existing" ]]; then
             log_error "No existing yolo session found"
             exit 1
@@ -149,7 +294,8 @@ main() {
             inject_control_command "$SCRIPT_DIR" "$existing" "$resumed_audit_log" "$control_command"
         fi
         log_info "Re-attaching to session: $existing"
-        exec tmux_attach "$existing"
+        tmux_attach "$existing"
+        exit $?
     fi
 
     # Read prompt from file if --file was given
@@ -264,8 +410,8 @@ main() {
         cmd="$cmd ; touch '$(wt_done_marker "$SESSION_NAME" 1)'"
     fi
 
-    tmux new-session -d -s "$SESSION_NAME" -n "agent-1" -c "$agent_dir"
-    tmux send-keys -t "$SESSION_NAME:agent-1" "$cmd" C-m
+    tmux_run new-session -d -s "$SESSION_NAME" -n "agent-1" -c "$agent_dir"
+    tmux_run send-keys -t "$SESSION_NAME:agent-1" "$cmd" C-m
 
     log_info "Started agent-1: ${first_task:+${first_task:0:60}...}${first_task:-interactive}"
 
@@ -286,8 +432,8 @@ main() {
             cmd="$cmd ; touch '$(wt_done_marker "$SESSION_NAME" $((i+1)))'"
         fi
 
-        tmux new-window -t "$SESSION_NAME" -n "$win_name" -c "$agent_dir"
-        tmux send-keys -t "$SESSION_NAME:$win_name" "$cmd" C-m
+        tmux_run new-window -t "$SESSION_NAME" -n "$win_name" -c "$agent_dir"
+        tmux_run send-keys -t "$SESSION_NAME:$win_name" "$cmd" C-m
 
         log_info "Started $win_name: ${task:+${task:0:60}...}${task:-interactive}"
     done
@@ -314,20 +460,20 @@ main() {
             [[ -n "$model" ]] && merge_opts="$merge_opts --model $model"
             [[ -n "$effort" ]] && merge_opts="$merge_opts --effort $effort"
 
-            tmux new-window -t "$SESSION_NAME" -n "merge" -c "$work_dir"
-            tmux send-keys -t "$SESSION_NAME:merge" \
+            tmux_run new-window -t "$SESSION_NAME" -n "merge" -c "$work_dir"
+            tmux_run send-keys -t "$SESSION_NAME:merge" \
                 "bash '$SCRIPT_DIR/lib/merge-resolver.sh' '$SESSION_NAME' '$AUDIT_LOG' $merge_opts" C-m
         fi
     fi
 
     # Create control window with audit log tailing and slash commands
-    tmux new-window -t "$SESSION_NAME" -n "control" -c "$work_dir"
+    tmux_run new-window -t "$SESSION_NAME" -n "control" -c "$work_dir"
     local control_mode="standard"
     (( worktree_mode )) && control_mode="worktree"
     local control_script="${SCRIPT_DIR//\'/\'\\\'\'}"
     local control_session="${SESSION_NAME//\'/\'\\\'\'}"
     local control_log="${AUDIT_LOG//\'/\'\\\'\'}"
-    tmux send-keys -t "$SESSION_NAME:control" \
+    tmux_run send-keys -t "$SESSION_NAME:control" \
         "bash '$control_script/lib/control-pane.sh' '$control_session' '$control_log' '$control_mode'" C-m
 
     # Inject one-shot control command if requested (-c/--command). Runs in the
@@ -337,7 +483,7 @@ main() {
     fi
 
     # Select the first agent window
-    tmux select-window -t "$SESSION_NAME:agent-1"
+    tmux_run select-window -t "$SESSION_NAME:agent-1"
 
     log_info "Attaching to session (Ctrl-b n/p to switch windows, Ctrl-b d to detach)"
     log_info "Audit log: $AUDIT_LOG"
